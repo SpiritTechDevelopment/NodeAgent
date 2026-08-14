@@ -1,0 +1,56 @@
+name: Daily PR Summary
+
+on:
+  schedule:
+    # Каждый день в 9:00 UTC (12:00 МСК).
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  summary:
+    name: Send daily PR summary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Get open PRs
+        id: prs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: pullRequests } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            return pullRequests;
+
+      - name: Send PR summary to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          PRS='${{ steps.prs.outputs.result }}'
+          PR_COUNT=$(echo "$PRS" | jq 'length')
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            MESSAGE=$(printf "📊 *Ежедневный отчет по PR*\n\n✅ Нет открытых Pull Requests")
+          else
+            PR_LIST=$(echo "$PRS" | jq -r '.[] | "• [PR #\(.number)](\(.html_url))\n  *\(.title)*\n  👤 @\(.user.login) | 📅 \(.created_at[:10])\n  💬 \(.comments) комментариев\n"')
+            MESSAGE=$(printf "📊 *Ежедневный отчет по PR*\n\n*Открытых PR:* %s\n\n%s\n[Все PR](https://github.com/${{ github.repository }}/pulls)" "$PR_COUNT" "$PR_LIST")
+          fi
+
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d message_thread_id="20" \
+              -d text="${MESSAGE}" \
+              -d parse_mode="Markdown" \
+              -d disable_web_page_preview="true"
+          else
+            echo "Telegram credentials not configured. Skipping notification."
+          fi

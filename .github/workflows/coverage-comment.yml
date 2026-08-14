@@ -1,0 +1,49 @@
+name: Coverage Comment
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  coverage-comment:
+    name: Coverage Comment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests with coverage
+        run: scripts/coverage.sh coverage.out
+
+      - name: Generate coverage summary
+        run: |
+          TOTAL_COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+          echo "## Test Coverage Report" > coverage_report.md
+          echo "" >> coverage_report.md
+          echo "**Total Coverage:** \`$TOTAL_COVERAGE\`" >> coverage_report.md
+          echo "" >> coverage_report.md
+          echo "Полный HTML-отчёт доступен в artifacts основного CI workflow." >> coverage_report.md
+
+      - name: Comment PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const coverage = fs.readFileSync('coverage_report.md', 'utf8');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: coverage
+            });

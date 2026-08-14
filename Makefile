@@ -1,10 +1,14 @@
-.PHONY: build proto proto-lint test test-coverage coverage-html vet check hooks xray-smoke
+.PHONY: build image proto proto-lint test test-coverage coverage-html vet check hooks xray-smoke
 
 VERSION ?= dev
+IMAGE ?= node-agent:dev
 
 build: ## Собрать исполняемый node-agent с указанной VERSION.
 	mkdir -p bin
 	go build -trimpath -ldflags "-X main.version=$(VERSION)" -o bin/node-agent ./cmd/node-agent
+
+image: ## Собрать локальный OCI-образ с указанными IMAGE и VERSION.
+	docker build --build-arg VERSION=$(VERSION) --tag $(IMAGE) .
 
 proto: ## Сгенерировать Go-код из локальной копии protobuf-контракта.
 	go tool buf generate

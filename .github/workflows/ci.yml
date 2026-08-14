@@ -155,3 +155,117 @@ jobs:
 
       - name: Build node-agent
         run: make build VERSION="sha-${GITHUB_SHA}"
+
+  publish-image:
+    name: Publish OCI image
+    runs-on: ubuntu-latest
+    needs: [test, lint, build]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "Release tag must use the vMAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tag must point to a commit reachable from main"
+            exit 1
+          fi
+
+      - name: Resolve image metadata
+        id: image
+        shell: bash
+        run: |
+          OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${OWNER}/node-agent" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            echo "version=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image labels and tags
+        id: meta
+        if: github.ref == 'refs/heads/develop'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=SpiritVPN NodeAgent
+            org.opencontainers.image.description=Node agent for the SpiritVPN fleet
+          tags: |
+            type=raw,value=develop-${{ github.sha }}
+            type=raw,value=sha-${{ github.sha }}
+
+      - name: Build and publish image
+        id: push
+        if: github.ref == 'refs/heads/develop'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Promote tested image to release tag
+        id: promote
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          SOURCE_IMAGE="${IMAGE_NAME}:develop-${GITHUB_SHA}"
+          TARGET_IMAGE="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          SOURCE_DIGEST=$(docker buildx imagetools inspect "$SOURCE_IMAGE" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          if [ -z "$SOURCE_DIGEST" ]; then
+            echo "Tested develop image was not found: ${SOURCE_IMAGE}"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$TARGET_IMAGE" "$SOURCE_IMAGE"
+          TARGET_DIGEST=$(docker buildx imagetools inspect "$TARGET_IMAGE" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          if [ "$TARGET_DIGEST" != "$SOURCE_DIGEST" ]; then
+            echo "Release promotion changed digest: ${SOURCE_DIGEST} -> ${TARGET_DIGEST}"
+            exit 1
+          fi
+          echo "digest=${TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish deployment reference
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest || steps.promote.outputs.digest }}
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

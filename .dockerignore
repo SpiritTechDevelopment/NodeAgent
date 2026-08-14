@@ -1,0 +1,16 @@
+.git
+.github
+.agents
+.codex
+.idea
+.vscode
+bin
+coverage.*
+coverage_cache.txt
+docs
+*.md
+.pre-commit-config.yaml
+Makefile
+buf.gen.yaml
+buf.yaml
+proto

@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  # Стиль локальной копии контракта определяется инфраструктурным репозиторием.
+  ignore:
+    - proto/spiritvpn/nodeagent
+breaking:
+  use:
+    - FILE

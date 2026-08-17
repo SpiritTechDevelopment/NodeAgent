@@ -1,0 +1,251 @@
+syntax = "proto3";
+
+package spiritvpn.nodeagent.v1;
+
+option go_package = "github.com/SpiritTechDevelopment/Infrastructure/contracts/nodeagent/v1;nodeagentv1";
+
+// NodeAgentService is served by an agent on an entry node. The backend is the
+// client. Transport authentication is mutual TLS over the management WireGuard
+// overlay. The backend maps the agent's server certificate to node_id; the
+// agent accepts only the backend client identity and returns its configured
+// node_id. No arbitrary request field selects a node.
+service NodeAgentService {
+  // Returns health, independent unacknowledged usage/activity batches, and
+  // optionally the latest agent-observed Xray user inventory.
+  rpc GetNodeState(GetNodeStateRequest) returns (GetNodeStateResponse);
+
+  // Idempotently makes one backend-owned runtime user present in Xray.
+  rpc EnsureUserPresent(EnsureUserPresentRequest) returns (OperationResult);
+
+  // Idempotently makes one backend-owned runtime user absent from Xray.
+  rpc EnsureUserAbsent(EnsureUserAbsentRequest) returns (OperationResult);
+
+  // Bootstraps or repairs the complete backend-owned user set. Normal changes
+  // use the two Ensure methods; this method is for initialization and recovery.
+  rpc ReconcileUsers(ReconcileUsersRequest) returns (ReconcileUsersResponse);
+
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message User {
+  // Stable pseudonymous accounting identifier used as Xray's "email" field.
+  // It is distinct from credential_uuid and survives credential rotation.
+  string accounting_id = 1;
+
+  // VLESS authentication credential. Treat as a secret.
+  string credential_uuid = 2;
+
+  // Empty or "xtls-rprx-vision" in v1.
+  string flow = 3;
+
+  // Egress selector for this user. The agent maps it to a static Xray outbound
+  // and installs a per-user routing rule (user:[accounting_id] -> outbound) via
+  // RoutingService. Empty means local egress ("direct", FREEDOM). For a BRIDGE
+  // it is the relation's manifest egress_tag (verbatim; infra owns the naming).
+  string egress_key = 4;
+}
+
+message ActualUser {
+  User user = 1;
+
+  // True only for the customer namespace owned by the backend/agent. The agent
+  // never removes infrastructure-owned or unknown users during reconciliation.
+  bool backend_managed = 2;
+}
+
+message UsageCursor {
+  // Random UUID persisted for the lifetime of one local usage spool. A new
+  // SQLite database creates a new spool_id and starts sequence from zero.
+  string spool_id = 1;
+
+  // Monotonically increasing within spool_id.
+  uint64 sequence = 2;
+}
+
+message UserUsage {
+  string accounting_id = 1;
+  uint64 uplink_bytes = 2;
+  uint64 downlink_bytes = 3;
+}
+
+message UsageBatch {
+  UsageCursor cursor = 1;
+  int64 collected_at_unix_ms = 2;
+  repeated UserUsage items = 3;
+}
+
+message ActivityCursor {
+  // Random UUID persisted for the lifetime of the independent local activity
+  // spool. It is intentionally separate from UsageCursor.
+  string spool_id = 1;
+
+  // Monotonically increasing within spool_id.
+  uint64 sequence = 2;
+}
+
+enum IpAddressFamily {
+  IP_ADDRESS_FAMILY_UNSPECIFIED = 0;
+  IP_ADDRESS_FAMILY_V4 = 1;
+  IP_ADDRESS_FAMILY_V6 = 2;
+}
+
+message SourceActivity {
+  string accounting_id = 1;
+
+  // Unpadded base64url HMAC-SHA256 of the canonical source network (43 ASCII
+  // characters in v1). This is never a raw IP.
+  string ip_token = 2;
+
+  // Safe identifier matching [A-Za-z0-9._-]{1,32}; never the HMAC key.
+  string ip_token_key_id = 3;
+  IpAddressFamily address_family = 4;
+
+  // 32 for an IPv4 host and normally 64 for a normalized IPv6 source in v1.
+  uint32 prefix_length = 5;
+
+  int64 first_seen_at_unix_ms = 6;
+  int64 last_seen_at_unix_ms = 7;
+  uint64 connection_count = 8;
+}
+
+message ActivityBatch {
+  ActivityCursor cursor = 1;
+
+  // The agent emits only closed, immutable UTC-aligned buckets.
+  int64 bucket_start_unix_ms = 2;
+  int64 bucket_end_unix_ms = 3;
+  repeated SourceActivity items = 4;
+}
+
+message ActivityState {
+  bool enabled = 1;
+  bool healthy = 2;
+  int64 last_closed_bucket_end_unix_ms = 3;
+  uint64 outbox_batches = 4;
+
+  // Sanitized diagnostic; never includes a raw access-log line, IP, UUID,
+  // token, key, or browsing destination.
+  string last_error = 5;
+}
+
+message XrayState {
+  bool reachable = 1;
+  uint64 uptime_seconds = 2;
+
+  // Sanitized diagnostic text only. It must never include UUIDs, tokens,
+  // private keys, full API payloads, or destination activity.
+  string last_error = 3;
+}
+
+message GetNodeStateRequest {
+  // The backend sets this only after all batches through this cursor have been
+  // committed to PostgreSQL. The agent ignores an acknowledgement for a
+  // different spool_id or beyond its highest emitted sequence, and never
+  // deletes unacknowledged batches.
+  UsageCursor acknowledged_usage_through = 1;
+
+  // Upper bound on returned batches. Zero selects the agent default.
+  uint32 max_usage_batches = 2;
+
+  // When true, return the latest inventory observed directly from Xray.
+  bool include_users = 3;
+
+  // Activity acknowledgement is independent from usage acknowledgement. It is
+  // applied only after PostgreSQL commits every activity batch through it.
+  ActivityCursor acknowledged_activity_through = 4;
+
+  // Upper bound on returned activity batches. Zero selects the agent default.
+  uint32 max_activity_batches = 5;
+}
+
+message GetNodeStateResponse {
+  string node_id = 1;
+  string agent_version = 2;
+
+  // True when local state is new/corrupt and the backend must call
+  // ReconcileUsers before the agent is allowed to prune users.
+  bool needs_bootstrap = 3;
+
+  XrayState xray = 4;
+  repeated UsageBatch usage_batches = 5;
+
+  // Zero when include_users was false or no complete Xray observation exists.
+  int64 users_observed_at_unix_ms = 6;
+  repeated ActualUser users = 7;
+
+  // True only when users is a complete, non-truncated Xray inventory. The
+  // backend never derives removal operations unless this is true.
+  bool users_complete = 8;
+
+  // Sanitized source-IP observations from the independent activity outbox.
+  // Items contain HMAC tokens, never raw IPs or browsing destinations.
+  repeated ActivityBatch activity_batches = 9;
+
+  ActivityState activity = 10;
+}
+
+message EnsureUserPresentRequest {
+  // Globally unique, stable across retries. Reusing an operation_id with a
+  // different request payload is a permanent error.
+  string operation_id = 1;
+  User user = 2;
+}
+
+message EnsureUserAbsentRequest {
+  // Globally unique, stable across retries. Reusing an operation_id with a
+  // different request payload is a permanent error.
+  string operation_id = 1;
+  string accounting_id = 2;
+}
+
+enum ApplyStatus {
+  APPLY_STATUS_UNSPECIFIED = 0;
+  APPLY_STATUS_APPLIED = 1;
+  APPLY_STATUS_ALREADY_APPLIED = 2;
+  APPLY_STATUS_RETRYABLE_ERROR = 3;
+  APPLY_STATUS_PERMANENT_ERROR = 4;
+}
+
+message OperationResult {
+  string operation_id = 1;
+  ApplyStatus status = 2;
+
+  // Sanitized operator-facing diagnostic; the same secrecy rules as
+  // XrayState.last_error apply.
+  string message = 3;
+}
+
+message ReconcileUsersRequest {
+  // Globally unique, stable across retries. Reusing an operation_id with a
+  // different complete user set is a permanent error.
+  string operation_id = 1;
+
+  // Must be true. This explicit completeness marker prevents a truncated list
+  // from being interpreted as an authoritative empty/partial desired set.
+  bool complete = 2;
+
+  repeated User users = 3;
+}
+
+message ReconcileUsersResponse {
+  OperationResult operation = 1;
+  uint32 added = 2;
+  uint32 replaced = 3;
+  uint32 removed = 4;
+  uint32 unchanged = 5;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string node_id = 1;
+  string agent_version = 2;
+
+  // True only when SQLite control/usage state is writable, Xray is reachable,
+  // bootstrap is complete, and usage can be collected safely. Activity has an
+  // independent degraded state and does not make user control unready.
+  bool ready = 3;
+  bool needs_bootstrap = 4;
+  XrayState xray = 5;
+  ActivityState activity = 6;
+}

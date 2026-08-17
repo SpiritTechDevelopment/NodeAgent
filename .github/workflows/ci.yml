@@ -1,0 +1,271 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Restore coverage cache
+        uses: actions/cache/restore@v5
+        with:
+          path: coverage_cache.txt
+          key: coverage-${{ github.ref }}-
+          restore-keys: |
+            coverage-${{ github.ref }}-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests with coverage
+        run: scripts/coverage.sh coverage.out
+
+      - name: Generate coverage report
+        run: go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-report
+          path: coverage.html
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          if [ -z "$COVERAGE" ]; then
+            echo "Failed to parse total coverage from coverage.out"
+            exit 1
+          fi
+          echo "Current coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "Coverage $COVERAGE% is below the 80% threshold"
+            exit 1
+          fi
+          echo "Coverage $COVERAGE% meets the 80% threshold"
+
+      - name: Send coverage report to Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out 2>/dev/null | grep total | awk '{print $3}' || true)
+          PREV_COVERAGE=""
+          if [ -f coverage_cache.txt ]; then
+            PREV_COVERAGE=$(cat coverage_cache.txt)
+          fi
+          echo "$COVERAGE" > coverage_cache.txt
+          STATUS="Passed"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="Failed"
+          fi
+          if [ "$COVERAGE" == "$PREV_COVERAGE" ] && [ -n "$PREV_COVERAGE" ] && [ "$STATUS" == "Passed" ]; then
+            exit 0
+          fi
+          if [ -n "${{ github.head_ref }}" ]; then
+            BRANCH="${{ github.head_ref }} → ${{ github.base_ref }}"
+          else
+            BRANCH="${GITHUB_REF#refs/heads/}"
+          fi
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
+          COMMIT_SHA=${GITHUB_SHA::7}
+          COVERAGE_CHANGE=""
+          if [ -n "$PREV_COVERAGE" ] && [ -n "$COVERAGE" ]; then
+            PREV_NUM=$(echo "$PREV_COVERAGE" | sed 's/%//')
+            CURR_NUM=$(echo "$COVERAGE" | sed 's/%//')
+            DIFF=$(echo "$CURR_NUM - $PREV_NUM" | bc)
+            if (( $(echo "$DIFF > 0" | bc -l) )); then
+              COVERAGE_CHANGE=" +${DIFF}%"
+            elif (( $(echo "$DIFF < 0" | bc -l) )); then
+              COVERAGE_CHANGE=" ${DIFF}%"
+            fi
+          fi
+          MESSAGE=$'*Coverage Report*\n\n*Project:* NodeAgent\n*Branch:* '"$BRANCH"$'\n*Commit:* '"$COMMIT_SHA"$'\n*Coverage:* '"$COVERAGE$COVERAGE_CHANGE"$'\n*Status:* '"$STATUS"$'\n\n_'"$COMMIT_MSG"$'_\n\n[View Details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})'
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d message_thread_id="18" \
+              -d text="${MESSAGE}" \
+              -d parse_mode="Markdown"
+          fi
+
+      - name: Save coverage cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: coverage_cache.txt
+          key: coverage-${{ github.ref }}-${{ github.sha }}
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Verify protobuf generated code
+        run: |
+          go tool buf lint
+          go tool buf generate
+          git diff --exit-code -- internal/gen
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build node-agent
+        run: make build VERSION="sha-${GITHUB_SHA}"
+
+  publish-image:
+    name: Publish OCI image
+    runs-on: ubuntu-latest
+    needs: [test, lint, build]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "Release tag must use the vMAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tag must point to a commit reachable from main"
+            exit 1
+          fi
+
+      - name: Resolve image metadata
+        id: image
+        shell: bash
+        run: |
+          OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${OWNER}/node-agent" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            echo "version=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image labels and tags
+        id: meta
+        if: github.ref == 'refs/heads/develop'
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=SpiritVPN NodeAgent
+            org.opencontainers.image.description=Node agent for the SpiritVPN fleet
+          tags: |
+            type=raw,value=develop-${{ github.sha }}
+            type=raw,value=sha-${{ github.sha }}
+
+      - name: Build and publish image
+        id: push
+        if: github.ref == 'refs/heads/develop'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Promote tested image to release tag
+        id: promote
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          SOURCE_IMAGE="${IMAGE_NAME}:develop-${GITHUB_SHA}"
+          TARGET_IMAGE="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          SOURCE_DIGEST=$(docker buildx imagetools inspect "$SOURCE_IMAGE" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          if [ -z "$SOURCE_DIGEST" ]; then
+            echo "Tested develop image was not found: ${SOURCE_IMAGE}"
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$TARGET_IMAGE" "$SOURCE_IMAGE"
+          TARGET_DIGEST=$(docker buildx imagetools inspect "$TARGET_IMAGE" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
+          if [ "$TARGET_DIGEST" != "$SOURCE_DIGEST" ]; then
+            echo "Release promotion changed digest: ${SOURCE_DIGEST} -> ${TARGET_DIGEST}"
+            exit 1
+          fi
+          echo "digest=${TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish deployment reference
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest || steps.promote.outputs.digest }}
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

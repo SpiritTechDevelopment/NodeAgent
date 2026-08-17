@@ -13,9 +13,10 @@
 
 # Code coverage profiles and other test artifacts
 *.out
-coverage.*
+/coverage.*
 *.coverprofile
 profile.cov
+coverage_cache.txt
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -30,3 +31,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+# Результаты сборки.
+/bin/

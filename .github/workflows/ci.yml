@@ -3,7 +3,7 @@ name: CI/CD Pipeline
 on:
   push:
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -160,14 +160,27 @@ jobs:
     name: Publish OCI image
     runs-on: ubuntu-latest
     needs: [test, lint, build]
+    # Единственная линия — main: каждый её коммит собирается и едет в среду
+    # develop. Тег продвигает уже собранное в prod, не пересобирая.
+    #
+    # Промежуточной ветки нет намеренно. С ней тег вставал бы на коммит,
+    # созданный слиянием, — а такой коммит никогда не собирался, и продвижение
+    # не нашло бы образ. Интерфейс GitHub слить с сохранением SHA не умеет:
+    # merge, squash и rebase создают новые SHA все три.
     if: >-
       github.event_name == 'push' &&
-      (github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
+    # Сборка и продвижение взаимоисключающие: пропущенный шаг даёт пустую
+    # строку, и `||` выбирает тот, который отработал.
+    outputs:
+      environment: ${{ steps.image.outputs.environment }}
+      repository: ${{ steps.image.outputs.name }}
+      digest: ${{ steps.push.outputs.digest || steps.promote.outputs.digest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -193,10 +206,15 @@ jobs:
         run: |
           OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/${OWNER}/node-agent" >> "$GITHUB_OUTPUT"
-          if [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+          # Ветка отображается на среду здесь и больше нигде: инфраструктура
+          # получает уже готовое имя среды, а не правило его вывода. main — это
+          # среда develop, тег — prod.
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
             echo "version=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "environment=develop" >> "$GITHUB_OUTPUT"
           else
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
@@ -209,9 +227,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Тег один — sha-<коммит>. Второй, по имени ветки, существовал ради
+      # навигации по registry, но именно на него смотрел шаг продвижения, и
+      # переименование ветки тихо ломало релиз. Идентичность деплоя всё равно
+      # несёт digest, а не тег.
       - name: Generate image labels and tags
         id: meta
-        if: github.ref == 'refs/heads/develop'
+        if: github.ref == 'refs/heads/main'
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.image.outputs.name }}
@@ -219,12 +241,11 @@ jobs:
             org.opencontainers.image.title=SpiritVPN NodeAgent
             org.opencontainers.image.description=Node agent for the SpiritVPN fleet
           tags: |
-            type=raw,value=develop-${{ github.sha }}
             type=raw,value=sha-${{ github.sha }}
 
       - name: Build and publish image
         id: push
-        if: github.ref == 'refs/heads/develop'
+        if: github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -245,11 +266,11 @@ jobs:
         env:
           IMAGE_NAME: ${{ steps.image.outputs.name }}
         run: |
-          SOURCE_IMAGE="${IMAGE_NAME}:develop-${GITHUB_SHA}"
+          SOURCE_IMAGE="${IMAGE_NAME}:sha-${GITHUB_SHA}"
           TARGET_IMAGE="${IMAGE_NAME}:${GITHUB_REF_NAME}"
           SOURCE_DIGEST=$(docker buildx imagetools inspect "$SOURCE_IMAGE" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)
           if [ -z "$SOURCE_DIGEST" ]; then
-            echo "Tested develop image was not found: ${SOURCE_IMAGE}"
+            echo "Tested image was not found: ${SOURCE_IMAGE} — commit was never built on main"
             exit 1
           fi
           docker buildx imagetools create --tag "$TARGET_IMAGE" "$SOURCE_IMAGE"
@@ -269,3 +290,37 @@ jobs:
           echo '```text' >> "$GITHUB_STEP_SUMMARY"
           echo "${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # Инфраструктура узнаёт о новом образе отсюда. Событие несёт факт «образ
+  # опубликован», а не команду на выкатку: что из этого следует — digest в
+  # desired state, коммит, раскатка на ноды — решает принимающая сторона.
+  notify-infrastructure:
+    name: Notify infrastructure
+    runs-on: ubuntu-latest
+    needs: [publish-image]
+    steps:
+      - name: Dispatch the agent release
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+          ENVIRONMENT: ${{ needs['publish-image'].outputs.environment }}
+          REPOSITORY: ${{ needs['publish-image'].outputs.repository }}
+          DIGEST: ${{ needs['publish-image'].outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Пустой digest означает, что ни сборка, ни продвижение не отработали.
+          # Отправлять неполное событие нельзя: принимающая сторона запишет его
+          # в desired state.
+          test -n "$DIGEST"
+          # jq сам экранирует значения; сборка JSON конкатенацией строк ломается
+          # на первом же неожиданном символе.
+          jq -n \
+            --arg environment "$ENVIRONMENT" \
+            --arg source_git_sha "$GITHUB_SHA" \
+            --arg repository "$REPOSITORY" \
+            --arg digest "$DIGEST" \
+            '{event_type: "agent-release", client_payload: {
+                environment: $environment,
+                source_git_sha: $source_git_sha,
+                image: {repository: $repository, digest: $digest}}}' \
+            | gh api repos/SpiritTechDevelopment/Infrastructure/dispatches \
+                --method POST --input -

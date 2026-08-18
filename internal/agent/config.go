@@ -60,7 +60,7 @@ type Config struct {
 	LogLevel slog.Level
 	// ListenAddress содержит конкретный management IP и порт gRPC.
 	ListenAddress string
-	// HTTPListenAddress содержит loopback IP и порт служебного HTTP-сервера.
+	// HTTPListenAddress содержит конкретный IP и порт служебного HTTP-сервера.
 	HTTPListenAddress string
 	// GRPC задаёт параметры mTLS-сервера.
 	GRPC grpcserver.Config
@@ -105,7 +105,7 @@ func LoadConfig(getenv func(string) string, version string) (Config, error) {
 		errs = append(errs, fmt.Errorf("%w: %s", ErrInvalidConfig, EnvGRPCListen))
 	}
 	config.ListenAddress = listenAddress
-	httpListenAddress, err := localListenAddress(value(getenv, EnvHTTPListen, defaultHTTPListenAddress))
+	httpListenAddress, err := managementListenAddress(value(getenv, EnvHTTPListen, defaultHTTPListenAddress))
 	if err != nil {
 		errs = append(errs, fmt.Errorf("%w: %s", ErrInvalidConfig, EnvHTTPListen))
 	}
@@ -182,20 +182,17 @@ func managementListenAddress(raw string) (string, error) {
 	return net.JoinHostPort(ip.String(), strconv.FormatUint(port, 10)), nil
 }
 
-func localListenAddress(raw string) (string, error) {
-	address, err := managementListenAddress(raw)
-	if err != nil {
-		return "", err
-	}
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", err
-	}
-	if !net.ParseIP(host).IsLoopback() {
-		return "", errors.New("listener must use a loopback IP")
-	}
-	return address, nil
-}
+// Служебный HTTP listener подчиняется тому же правилу, что и gRPC: конкретный
+// числовой адрес, никаких wildcard. Требование loopback снято сознательно —
+// метрики и health агента собирает Prometheus управляющего контура, и с
+// loopback их не видно ниоткуда, включая тот случай, ради которого сбор и
+// заводился: упавший агент.
+//
+// Раскрытие при этом не расширяется до сети общего пользования: адрес выбирает
+// развёртывание, оно же выбирает management-оверлей, а на той же ноде по тому
+// же оверлею уже доступен node_exporter, раскрывающий несравнимо больше.
+// Ответственность за то, чтобы адрес не оказался публичным, лежит на
+// развёртывании — как и для gRPC.
 
 func clientIdentities(raw string) ([]string, error) {
 	var identities []string

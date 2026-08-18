@@ -62,11 +62,27 @@ func TestLoadConfigAppliesOptionalOverrides(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsNonLoopbackHTTPListeners(t *testing.T) {
+// Служебный HTTP listener разрешено открывать в management-сети. Иначе метрики
+// и health агента не видны управляющему контуру, который их собирает, — а
+// значит не виден и упавший агент, ради которого сбор и заводился.
+func TestLoadConfigAcceptsManagementHTTPListener(t *testing.T) {
+	environment := validEnvironment()
+	environment[EnvHTTPListen] = "10.82.2.11:9090"
+	config, err := LoadConfig(mapEnvironment(environment), "test")
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if config.HTTPListenAddress != "10.82.2.11:9090" {
+		t.Fatalf("HTTP listen address = %q", config.HTTPListenAddress)
+	}
+}
+
+// Wildcard и неразбираемый адрес остаются запрещёнными: конкретный адрес — это
+// то, чем развёртывание выбирает сеть, и потерять этот выбор нельзя.
+func TestLoadConfigRejectsUnspecifiedHTTPListeners(t *testing.T) {
 	for _, address := range []string{
 		":9090",
 		"0.0.0.0:9090",
-		"10.82.2.11:9090",
 		"localhost:9090",
 		"127.0.0.1:0",
 	} {

@@ -31,12 +31,14 @@
 Агенту принадлежат:
 
 * runtime users клиентского inbound входной ноды и их персональные routing rules;
+* файловые entries этих users/rules и завершающий default-deny;
 * локальная durable база: снапшот backend-owned набора и спул трафика;
 * сбор per-email счётчиков StatsService, включая их сброс.
 
-Агенту не принадлежат: конфигурация Xray (inbound, outbound, транспорт между
-нодами, инфраструктурные credentials — это infrastructure), состав флота, сроки
-доступа и квоты (backend), решения об удалении пользователей (backend, §6).
+Агенту не принадлежат остальные части конфигурации Xray (inbound, outbound,
+транспорт между нодами, инфраструктурные credentials — это infrastructure),
+состав флота, сроки доступа и квоты (backend), решения об удалении пользователей
+(backend, §6).
 
 Единица управления — один `accounting_id` на одной ноде. Сущности «устройство» в
 контракте нет.
@@ -148,7 +150,9 @@ Backend повторяет актуальную операцию без огра
 
 ## 3. Конфигурация
 
-Владелец — infrastructure. Агент читает и валидирует, ничего не досоздаёт.
+Infrastructure владеет статическими секциями, outbound и базовым шаблоном.
+Агент атомарно поддерживает в том же файле только clients namespace `u.*`,
+персональные rules `spirit-agent:user:*` и завершающий default-deny.
 
 | параметр | назначение |
 |---|---|
@@ -156,6 +160,7 @@ Backend повторяет актуальную операцию без огра
 | адрес и порт gRPC | слушатель в management-сети |
 | TLS: сертификат, ключ, CA | mTLS с backend |
 | адрес Xray API | по умолчанию `127.0.0.1:10085` |
+| путь writable Xray config | по умолчанию `/opt/vpn/xray/config.json` |
 | тег клиентского inbound | куда ставятся пользователи |
 | тег локального выхода | Xray outbound для FREEDOM; на проводе ему соответствует пустой `egress_key` |
 | путь локальной базы | по умолчанию `/var/lib/spirit-agent/state.db` |
@@ -169,17 +174,17 @@ Backend повторяет актуальную операцию без огра
 * на ноде включены `HandlerService`, `StatsService` и **`RoutingService`**;
 * соответствия `egress_tag → outbound` созданы статически заранее; персональные
   правила создаёт агент;
-* на входной ноде первым outbound объявлен `block`, поэтому отсутствие
-  совпавшего routing rule заканчивается BLACKHOLE;
-* статического catch-all правила `inboundTag → block/default_exit` на входной
-  ноде нет: Xray `RoutingService.AddRule(should_append=true)` добавляет правила
-  только в конец, и расположенный раньше catch-all сделал бы их недостижимыми;
+* default-deny `inboundTag → block` находится последним; агент переносит
+  существующий catch-all в конец либо создаёт его;
+* runtime-правила добавляются через `RoutingService.AddRule(should_append=false)`
+  и потому не оказываются после default-deny;
 * агент создаёт персональное правило и для FREEDOM, направляя его в
   сконфигурированный локальный outbound. Это сохраняет безопасный fallback в
   `block`, но позволяет валидному локальному доступу выйти через FREEDOM;
 * Xray API доступен только с loopback, удалённый `:10085` закрыт;
 * форма поставки агента (systemd-юнит либо контейнер) обеспечивает ему доступ к
-  loopback Xray и владение каталогом состояния.
+  loopback Xray, владение каталогом состояния и write/rename в каталоге
+  `config.json`.
 
 ## 4. Управление пользователями
 
@@ -229,18 +234,19 @@ StatsService считает трафик per-email.
 4. при замене credential — снять и durable записать в спул остаток трафика
    прежнего значения;
 5. записать желаемого пользователя в локальный снапшот **до** обращения к Xray;
-6. `HandlerService.AddUser` (email = `accounting_id`, id = `credential_uuid`,
+6. атомарно записать полный desired-набор clients и rules в `config.json`;
+7. `HandlerService.AddUser` (email = `accounting_id`, id = `credential_uuid`,
    flow);
-7. создать `RoutingService.AddRule(should_append=true)` с детерминированным
+8. создать `RoutingService.AddRule(should_append=false)` с детерминированным
    `rule_tag = "spirit-agent:user:" + accounting_id` вида
    `user:[accounting_id] → outbound(resolved_egress_tag)`, где пустой
    `egress_key` разрешается в сконфигурированный локальный outbound;
-8. проверить фактический результат в Xray;
-9. записать исход операции и ответить.
+9. проверить фактический результат в Xray;
+10. записать исход операции и ответить.
 
-Персональные правила добавляются после статических правил API и security policy,
-но на входной ноде перед ними нет catch-all. Если персональное правило не
-совпало, Xray использует первый outbound — `block`. Агент проверяет выбор выхода
+Персональные runtime-правила добавляются в начало, но фильтр `user` не даёт им
+перехватить служебный API-трафик. В файле они находятся после статических
+API/security rules и перед последним default-deny. Агент проверяет выбор выхода
 через `RoutingService.TestRoute` для `user=accounting_id`; одного успешного
 ответа `AddRule` недостаточно.
 
@@ -280,7 +286,10 @@ E2E-тестом.
 
 ## 5. Локальный self-heal
 
-Runtime users и routing rules Xray не персистятся: после рестарта Xray они пусты.
+Runtime API сам по себе не персистит users и rules. Поэтому до live-мутации агент
+записывает полный desired-набор в `config.json`. После рестарта Xray клиенты и
+маршруты загружаются непосредственно из файла; self-heal остаётся независимой
+проверкой и исправляет расхождения.
 
 Агент держит durable снапшот backend-owned набора —
 `{accounting_id, credential_uuid, flow, egress_key}` — и обновляет его на каждый
@@ -290,11 +299,9 @@ Runtime users и routing rules Xray не персистятся: после ре
 `reachable` после недоступности. **Не по пустому списку пользователей**: пустая
 и целая нода отличается от сброшенной именно по uptime.
 
-Периодический self-heal строго **add-only**: `AddUser` плюс `AddRule` на каждую
-запись снапшота с `desired_present=true`. Удалений по результату сравнения
-снапшота с Xray здесь нет никогда. Отставший снапшот может временно оставить
-лишнего пользователя — это переживаемо; снятие живого пользователя по
-отставшему снапшоту — нет.
+Периодический self-heal приводит каждую запись с `desired_present=true` к точным
+credential, flow и egress. Неизвестные runtime users он не удаляет; удаления
+разрешены только durable tombstone либо полным авторитетным ReconcileUsers.
 
 Отдельный recovery прерванных durable intent дозавершает только то действие,
 которое уже было записано до падения: present-intent добавляет/заменяет
@@ -306,8 +313,9 @@ recovery удалений запрещён.
 Self-heal и recovery работают при недоступном backend и ничего у него не
 запрашивают.
 
-Периодическая сверка снапшота с фактическим состоянием Xray — раз в 30 секунд и
-немедленно после обнаружения рестарта.
+Сверка запускается при старте агента, раз в 30 секунд и немедленно после
+обнаружения рестарта. Недоступность Xray повторяется с экспоненциальным backoff
+от 1 до 30 секунд, а не превращается в одноразовый отказ.
 
 ## 6. Authoritative reconcile
 
@@ -515,7 +523,7 @@ usage_batches(spool_id, sequence, collected_at, payload, acknowledged)
 | что | значение |
 |---|---|
 | сбор трафика из Xray | 15 с со случайной фазой |
-| сверка снапшота с Xray | 30 с и сразу после рестарта Xray |
+| сверка снапшота с Xray | при старте агента, каждые 30 с и сразу после рестарта Xray |
 | размер batch | ≤ 5 000 items |
 | batch в одном ответе | по запросу backend, сейчас 16 |
 
@@ -539,6 +547,12 @@ spirit_agent_usage_outbox_bytes
 spirit_agent_last_backend_poll_timestamp_seconds
 spirit_agent_local_reconcile_errors_total
 spirit_agent_needs_bootstrap
+spirit_agent_desired_users
+spirit_agent_desired_routing_rules
+spirit_agent_applied_users
+spirit_agent_applied_routing_rules
+spirit_agent_state_drift
+spirit_agent_last_successful_reconcile_timestamp_seconds
 ```
 
 Alert'ы: устаревший сбор, растущий или переполненный спул, недоступность Xray,
@@ -558,7 +572,7 @@ Alert'ы: устаревший сбор, растущий или перепол�
 |---|---|
 | backend недоступен | состояние Xray сохраняется, трафик копится в спуле |
 | агент недоступен | существующий трафик идёт, операции backend ждут |
-| Xray перезапущен | add-only восстановление из снапшота, без backend |
+| Xray перезапущен | users/rules загружаются из config.json; self-heal сверяет их без backend |
 | ответ на RPC потерян | backend повторяет тот же `operation_id`, результат берётся из журнала |
 | падение в середине добавления | снапшот записан до Xray, self-heal дозавершает |
 | падение в середине удаления | tombstone записан до Xray, self-heal дозавершает |
@@ -597,7 +611,7 @@ Alert'ы: устаревший сбор, растущий или перепол�
       выдача и удаление только по подтверждению;
 * [ ] `GetNodeState` с инвентарём: `users_complete`, время наблюдения,
       `backend_managed`, `egress_key`;
-* [ ] add-only self-heal с детектом рестарта по `uptime_seconds`;
+* [ ] сходящийся self-heal при старте, по таймеру и после рестарта Xray;
 * [ ] `needs_bootstrap` и запрет удалений в этом состоянии;
 * [ ] `Health`, метрики §12.
 
@@ -610,8 +624,8 @@ Alert'ы: устаревший сбор, растущий или перепол�
       приезжают следующим опросом;
 * [ ] подтверждение чужого `spool_id` игнорируется; подтверждение выше выданного
       sequence игнорируется и алертит;
-* [ ] рестарт Xray восстанавливает пользователей и правила при выключенном
-      backend;
+* [ ] после рестарта Xray пользователи и правила уже загружены из файла при
+      выключенном backend;
 * [ ] отставший снапшот не удаляет пользователя, отсутствующего в нём;
 * [ ] `ReconcileUsers` с пустым набором снимает всех backend-owned и не трогает
       `svc-*`;
@@ -627,13 +641,13 @@ Alert'ы: устаревший сбор, растущий или перепол�
 
 * [ ] `RoutingService` присутствует в reflection и принимает `AddRule`,
       `RemoveRule`, `ListRule`, `TestRoute`;
-* [ ] entry-конфигурация содержит `block` первым outbound и не содержит
-      catch-all `inboundTag → block/default_exit`;
+* [ ] entry-конфигурация содержит персональные rules перед завершающим catch-all
+      `inboundTag → block`;
 * [ ] до добавления персонального правила `TestRoute` неизвестного
       `user=u.*` выбирает `block`;
-* [ ] FREEDOM-пользователь получает правило с `should_append=true`, а
+* [ ] FREEDOM-пользователь получает правило с `should_append=false`, а
       `TestRoute(user=accounting_id)` выбирает настроенный `direct`;
-* [ ] BRIDGE-пользователь получает правило с `should_append=true`, а `TestRoute`
+* [ ] BRIDGE-пользователь получает правило с `should_append=false`, а `TestRoute`
       выбирает переданный `egress_key`;
 * [ ] последовательное добавление нескольких персональных правил не меняет
       работу ранее добавленных правил и статических API/security rules;
@@ -643,8 +657,9 @@ Alert'ы: устаревший сбор, растущий или перепол�
 * [ ] реальный VLESS-трафик FREEDOM выходит через локальный FREEDOM outbound, а
       BRIDGE-трафик — через тестовый bridge outbound; одной проверки
       `TestRoute` для допуска схемы недостаточно;
-* [ ] после рестарта Xray динамические правила исчезают, а self-heal при
-      выключенном backend восстанавливает их вместе с пользователями.
+* [ ] после рестарта Xray без участия backend пользователь продолжает работать:
+      clients и rules уже присутствуют в `config.json`, self-heal подтверждает
+      отсутствие расхождения.
 
 E2E, до заявления жёсткого enforcement квоты:
 

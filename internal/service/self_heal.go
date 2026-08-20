@@ -107,7 +107,10 @@ func (s *Service) recoverAndAudit(ctx context.Context) error {
 	recoveryErr := s.recoverIntents(ctx)
 	auditErr := s.auditManagedUsers(ctx)
 	if recoveryErr != nil || auditErr != nil {
-		return errors.New("local self-heal did not converge")
+		return fmt.Errorf(
+			"local self-heal did not converge: %w",
+			errors.Join(recoveryErr, auditErr),
+		)
 	}
 	return nil
 }
@@ -139,12 +142,14 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 		return err
 	}
 	eligible := make(map[string]state.ManagedUser, len(pending))
-	hadFailure := false
+	var operationErrors []error
 	for _, user := range pending {
 		if user.DesiredPresent {
 			desired, err := s.desiredFromManagedUser(user)
 			if err != nil {
-				hadFailure = true
+				operationErrors = append(operationErrors, fmt.Errorf(
+					"accounting_id=%s desired state: %w", user.AccountingID, err,
+				))
 				continue
 			}
 			observed := runtimeUser(runtime, user.AccountingID)
@@ -154,7 +159,7 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 				desired.user,
 				desired.resolvedOutbound,
 			); err != nil {
-				hadFailure = true
+				operationErrors = append(operationErrors, err)
 				continue
 			}
 			eligible[user.AccountingID] = user
@@ -163,13 +168,17 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 		observed := runtimeUser(runtime, user.AccountingID)
 		if observed.user != nil {
 			if err := s.xray.RemoveUser(ctx, user.AccountingID); err != nil {
-				hadFailure = true
+				operationErrors = append(operationErrors, userRPCError(
+					user.AccountingID, "HandlerService.RemoveUser", err,
+				))
 				continue
 			}
 		}
 		if observed.rule != nil {
 			if err := s.xray.RemoveUserRule(ctx, user.AccountingID); err != nil {
-				hadFailure = true
+				operationErrors = append(operationErrors, userRPCError(
+					user.AccountingID, "RoutingService.RemoveRule", err,
+				))
 				continue
 			}
 		}
@@ -184,14 +193,32 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 	for accountingID, user := range eligible {
 		if user.DesiredPresent {
 			desired, err := s.desiredFromManagedUser(user)
-			if err != nil || !s.runtimeUserMatches(ctx, verified, desired) {
-				hadFailure = true
+			if err != nil {
+				operationErrors = append(operationErrors, fmt.Errorf(
+					"accounting_id=%s desired state: %w", accountingID, err,
+				))
+				continue
+			}
+			if err := s.runtimeUserMatchError(ctx, verified, desired); err != nil {
+				operationErrors = append(operationErrors, err)
 				continue
 			}
 		} else {
 			observed := runtimeUser(verified, accountingID)
-			if observed.user != nil || observed.rule != nil {
-				hadFailure = true
+			if observed.user != nil {
+				operationErrors = append(operationErrors, userRPCError(
+					accountingID,
+					"HandlerService.GetInboundUsers",
+					errors.New("user is still present after removal"),
+				))
+				continue
+			}
+			if observed.rule != nil {
+				operationErrors = append(operationErrors, userRPCError(
+					accountingID,
+					"RoutingService.ListRule",
+					errors.New("routing rule is still present after removal"),
+				))
 				continue
 			}
 		}
@@ -204,8 +231,11 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 			return err
 		}
 	}
-	if hadFailure {
-		return errors.New("one or more durable intents could not be recovered")
+	if len(operationErrors) > 0 {
+		return fmt.Errorf(
+			"one or more durable intents could not be recovered: %w",
+			errors.Join(operationErrors...),
+		)
 	}
 	return nil
 }
@@ -225,7 +255,7 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	hadFailure := false
+	var operationErrors []error
 	desiredUsers := make([]reconcileDesiredUser, 0, len(users))
 	for _, user := range users {
 		if !user.DesiredPresent {
@@ -233,19 +263,21 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 		}
 		desired, err := s.desiredFromManagedUser(user)
 		if err != nil {
-			hadFailure = true
+			operationErrors = append(operationErrors, fmt.Errorf(
+				"accounting_id=%s desired state: %w", user.AccountingID, err,
+			))
 			continue
 		}
 		desiredUsers = append(desiredUsers, desired)
 		observed := runtimeUser(runtime, user.AccountingID)
 		matches, err := s.presentMatches(ctx, observed, user, desired.resolvedOutbound)
 		if err != nil {
-			hadFailure = true
+			operationErrors = append(operationErrors, err)
 			continue
 		}
 		if !matches {
 			if err := s.applyPresent(ctx, observed, user, desired.resolvedOutbound); err != nil {
-				hadFailure = true
+				operationErrors = append(operationErrors, err)
 				continue
 			}
 		}
@@ -255,13 +287,13 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 		return err
 	}
 	for _, desired := range desiredUsers {
-		if !s.runtimeUserMatches(ctx, verified, desired) {
-			hadFailure = true
+		if err := s.runtimeUserMatchError(ctx, verified, desired); err != nil {
+			operationErrors = append(operationErrors, err)
 		}
 	}
-	s.recordReconciliation(ctx, desiredUsers, verified, !hadFailure)
-	if hadFailure {
-		return errors.New("Xray audit did not converge")
+	s.recordReconciliation(ctx, desiredUsers, verified, len(operationErrors) == 0)
+	if len(operationErrors) > 0 {
+		return fmt.Errorf("Xray audit did not converge: %w", errors.Join(operationErrors...))
 	}
 	observedAt := s.now().UTC()
 	if err := s.state.SetLastXrayAuditAt(ctx, observedAt); err != nil {
@@ -357,14 +389,56 @@ func (s *Service) runtimeUserMatches(
 	runtime reconcileRuntime,
 	desired reconcileDesiredUser,
 ) bool {
+	return s.runtimeUserMatchError(ctx, runtime, desired) == nil
+}
+
+func (s *Service) runtimeUserMatchError(
+	ctx context.Context,
+	runtime reconcileRuntime,
+	desired reconcileDesiredUser,
+) error {
 	observed := runtimeUser(runtime, desired.user.AccountingID)
-	if observed.user == nil || observed.user.CredentialUUID != desired.user.CredentialUUID ||
-		observed.user.Flow != desired.user.Flow || observed.rule == nil ||
-		observed.rule.OutboundTag != desired.resolvedOutbound {
-		return false
+	if observed.user == nil {
+		return userRPCError(
+			desired.user.AccountingID,
+			"HandlerService.GetInboundUsers",
+			errors.New("desired user is missing"),
+		)
+	}
+	if observed.user.CredentialUUID != desired.user.CredentialUUID ||
+		observed.user.Flow != desired.user.Flow {
+		return userRPCError(
+			desired.user.AccountingID,
+			"HandlerService.GetInboundUsers",
+			errors.New("user credential or flow does not match desired state"),
+		)
+	}
+	if observed.rule == nil {
+		return userRPCError(
+			desired.user.AccountingID,
+			"RoutingService.ListRule",
+			errors.New("desired routing rule is missing"),
+		)
+	}
+	if observed.rule.OutboundTag != desired.resolvedOutbound {
+		return userRPCError(
+			desired.user.AccountingID,
+			"RoutingService.ListRule",
+			errors.New("routing rule outbound does not match desired state"),
+		)
 	}
 	outbound, err := s.xray.TestUserRoute(ctx, desired.user.AccountingID)
-	return err == nil && outbound == desired.resolvedOutbound
+	if err != nil {
+		return userRPCError(desired.user.AccountingID, "RoutingService.TestRoute", err)
+	}
+	if outbound != desired.resolvedOutbound {
+		return userRPCError(
+			desired.user.AccountingID,
+			"RoutingService.TestRoute",
+			fmt.Errorf("selected outbound %q does not match desired outbound", outbound),
+		)
+	}
+	return nil
 }
 
 func (s *Service) storeRecoveredUsers(

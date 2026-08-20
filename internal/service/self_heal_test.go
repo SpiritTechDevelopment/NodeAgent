@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -169,6 +170,133 @@ func TestAuditManagedUsersRepairsConflictingRuntime(t *testing.T) {
 	metadata, err := store.Metadata(context.Background())
 	if err != nil || metadata.LastXrayAuditAt.IsZero() {
 		t.Fatalf("успешный аудит не записал время: %v, error=%v", metadata.LastXrayAuditAt, err)
+	}
+}
+
+func TestRunSelfHealRestoresAppliedDesiredStateWithoutXrayRestart(t *testing.T) {
+	provider := &atomicStatusProvider{}
+	provider.reachable.Store(true)
+	provider.uptimeNanos.Store(int64(10 * time.Minute))
+	dependencies := newTestDependencies(t, provider)
+	for _, user := range []state.ManagedUser{
+		{
+			AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
+			DesiredPresent: true, Applied: true, UpdatedAt: time.Now(),
+		},
+		{
+			AccountingID: secondAccountingID, CredentialUUID: secondCredential,
+			EgressKey: "bridge-test", DesiredPresent: true, Applied: true, UpdatedAt: time.Now(),
+		},
+	} {
+		if err := dependencies.State.PutManagedUser(context.Background(), user); err != nil {
+			t.Fatalf("store applied desired user %q: %v", user.AccountingID, err)
+		}
+	}
+	service, err := New(
+		Config{NodeID: "node-test", AgentVersion: "test", LocalOutboundTag: "direct"},
+		dependencies,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.selfHealInterval = time.Hour
+	service.xrayProbeInterval = 2 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	reported := make(chan error, 16)
+	go func() {
+		done <- service.RunSelfHeal(ctx, func(err error) { reported <- err })
+	}()
+	waitForAuditAfter(t, dependencies.State, time.Time{})
+	runtime := dependencies.Xray.(*fakeXrayController)
+	assertReconciledRuntime(t, runtime, map[string]string{
+		testAccountingID:   "direct",
+		secondAccountingID: "bridge-test",
+	})
+	status := service.Reconciliation()
+	if status.DesiredUsers != 2 || status.AppliedUsers != 2 ||
+		status.AppliedRules != 2 || status.Drift != 0 {
+		t.Fatalf("reconciliation status = %+v", status)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-reported:
+		t.Fatalf("self-heal reported unexpected error: %v", err)
+	default:
+	}
+}
+
+func TestSelfHealErrorsIncludeAccountingIDAndRPC(t *testing.T) {
+	tests := []struct {
+		name       string
+		failMethod string
+		wantRPC    string
+		prepare    func(*fakeXrayController)
+	}{
+		{name: "add user", failMethod: "AddUser", wantRPC: "HandlerService.AddUser"},
+		{
+			name: "add rule", failMethod: "AddUserRule", wantRPC: "RoutingService.AddRule",
+			prepare: func(runtime *fakeXrayController) {
+				runtime.users[testAccountingID] = xray.User{
+					AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
+				}
+			},
+		},
+		{
+			name: "test route", failMethod: "TestUserRoute", wantRPC: "RoutingService.TestRoute",
+			prepare: func(runtime *fakeXrayController) {
+				runtime.users[testAccountingID] = xray.User{
+					AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
+				}
+				runtime.rules[testAccountingID] = xray.UserRule{
+					AccountingID: testAccountingID, OutboundTag: "direct",
+				}
+			},
+		},
+		{
+			name: "remove user", failMethod: "RemoveUser", wantRPC: "HandlerService.RemoveUser",
+			prepare: func(runtime *fakeXrayController) {
+				runtime.users[testAccountingID] = xray.User{
+					AccountingID: testAccountingID, CredentialUUID: secondCredential,
+				}
+			},
+		},
+		{
+			name: "remove rule", failMethod: "RemoveUserRule", wantRPC: "RoutingService.RemoveRule",
+			prepare: func(runtime *fakeXrayController) {
+				runtime.users[testAccountingID] = xray.User{
+					AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
+				}
+				runtime.rules[testAccountingID] = xray.UserRule{
+					AccountingID: testAccountingID, OutboundTag: "wrong",
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, runtime, _ := newUserTestService(t)
+			if err := store.PutManagedUser(context.Background(), state.ManagedUser{
+				AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
+				DesiredPresent: true, Applied: true, UpdatedAt: time.Now(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				test.prepare(runtime)
+			}
+			runtime.failMethod = test.failMethod
+			runtime.failErr = errors.New("injected failure")
+			err := service.recoverAndAudit(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "accounting_id="+testAccountingID) ||
+				!strings.Contains(err.Error(), "rpc="+test.wantRPC) {
+				t.Fatalf("self-heal error = %v", err)
+			}
+		})
 	}
 }
 

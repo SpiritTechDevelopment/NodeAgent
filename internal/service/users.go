@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash"
 	"strings"
 
@@ -341,7 +342,7 @@ func (s *Service) presentMatches(
 		return false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, userRPCError(desired.AccountingID, "RoutingService.TestRoute", err)
 	}
 	return outbound == resolvedOutbound, nil
 }
@@ -357,7 +358,7 @@ func (s *Service) applyPresent(
 		observed.user.Flow != desired.Flow {
 		if observed.user != nil {
 			if err := s.xray.RemoveUser(ctx, desired.AccountingID); err != nil {
-				return err
+				return userRPCError(desired.AccountingID, "HandlerService.RemoveUser", err)
 			}
 		}
 		if err := s.xray.AddUser(ctx, xray.User{
@@ -365,7 +366,7 @@ func (s *Service) applyPresent(
 			CredentialUUID: desired.CredentialUUID,
 			Flow:           desired.Flow,
 		}); err != nil {
-			return err
+			return userRPCError(desired.AccountingID, "HandlerService.AddUser", err)
 		}
 	}
 
@@ -374,20 +375,24 @@ func (s *Service) applyPresent(
 		outbound, err := s.xray.TestUserRoute(ctx, desired.AccountingID)
 		ruleMatches = err == nil && outbound == resolvedOutbound
 		if err != nil && !errors.Is(err, xray.ErrRouteNotFound) {
-			return err
+			return userRPCError(desired.AccountingID, "RoutingService.TestRoute", err)
 		}
 	}
 	if !ruleMatches {
 		if observed.rule != nil {
 			if err := s.xray.RemoveUserRule(ctx, desired.AccountingID); err != nil {
-				return err
+				return userRPCError(desired.AccountingID, "RoutingService.RemoveRule", err)
 			}
 		}
 		if err := s.xray.AddUserRule(ctx, desired.AccountingID, resolvedOutbound); err != nil {
-			return err
+			return userRPCError(desired.AccountingID, "RoutingService.AddRule", err)
 		}
 	}
 	return nil
+}
+
+func userRPCError(accountingID, rpc string, err error) error {
+	return fmt.Errorf("accounting_id=%s rpc=%s: %w", accountingID, rpc, err)
 }
 
 func (s *Service) tombstone(ctx context.Context, accountingID string) (state.ManagedUser, error) {

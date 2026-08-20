@@ -32,6 +32,11 @@ func TestEnsureUserPresentAppliesPersistsAndReplays(t *testing.T) {
 	}
 	assertApplyStatus(t, result, nodeagentv1.ApplyStatus_APPLY_STATUS_APPLIED)
 	assertRuntimeUser(t, runtime, testCredentialUUID, "direct")
+	persisted := service.xrayConfig.(*fakeXrayConfigWriter).users
+	if len(persisted) != 1 || persisted[0].User.AccountingID != testAccountingID ||
+		persisted[0].OutboundTag != "direct" {
+		t.Fatalf("persistent Xray config = %+v", persisted)
+	}
 	assertManagedUser(t, store, true, true, testCredentialUUID, "")
 	assertCompletedOperation(t, store, request.GetOperationId())
 
@@ -131,6 +136,23 @@ func TestEnsureUserPresentContinuesAfterPartialRoutingFailure(t *testing.T) {
 	}
 }
 
+func TestEnsureUserPresentDoesNotMutateRuntimeWhenConfigCannotPersist(t *testing.T) {
+	service, store, runtime, _ := newUserTestService(t)
+	service.xrayConfig.(*fakeXrayConfigWriter).err = errors.New("config is read-only")
+	result, err := service.EnsureUserPresent(
+		context.Background(),
+		presentRequest("operation-config-failure", testCredentialUUID, ""),
+	)
+	if err != nil {
+		t.Fatalf("EnsureUserPresent() gRPC error = %v", err)
+	}
+	assertApplyStatus(t, result, nodeagentv1.ApplyStatus_APPLY_STATUS_RETRYABLE_ERROR)
+	if runtime.mutationCount() != 0 {
+		t.Fatalf("runtime changed before durable config: %v", runtime.calls)
+	}
+	assertManagedUser(t, store, true, false, testCredentialUUID, "")
+}
+
 func TestEnsureUserAbsentFinalizesBeforeRemovalAndReplays(t *testing.T) {
 	events := make([]string, 0)
 	service, store, runtime, usage := newUserTestService(t)
@@ -168,6 +190,9 @@ func TestEnsureUserAbsentFinalizesBeforeRemovalAndReplays(t *testing.T) {
 		t.Fatalf("порядок операций = %v, ожидался %v", events, wantEvents)
 	}
 	assertManagedUser(t, store, false, true, testCredentialUUID, "")
+	if persisted := service.xrayConfig.(*fakeXrayConfigWriter).users; len(persisted) != 0 {
+		t.Fatalf("removed user remains in persistent config: %+v", persisted)
+	}
 	assertCompletedOperation(t, store, request.GetOperationId())
 
 	mutations := runtime.mutationCount()
@@ -378,8 +403,9 @@ func newTestDependencies(t *testing.T, provider StatusProvider) Dependencies {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return Dependencies{
-		Status: provider,
-		State:  store,
+		Status:     provider,
+		State:      store,
+		XrayConfig: &fakeXrayConfigWriter{},
 		Xray: &fakeXrayController{
 			users:  make(map[string]xray.User),
 			rules:  make(map[string]xray.UserRule),
@@ -387,6 +413,16 @@ func newTestDependencies(t *testing.T, provider StatusProvider) Dependencies {
 		},
 		Usage: &fakeUsageFinalizer{},
 	}
+}
+
+type fakeXrayConfigWriter struct {
+	users []xray.PersistentUser
+	err   error
+}
+
+func (writer *fakeXrayConfigWriter) Reconcile(_ context.Context, users []xray.PersistentUser) error {
+	writer.users = slices.Clone(users)
+	return writer.err
 }
 
 func assertApplyStatus(t *testing.T, result *nodeagentv1.OperationResult, want nodeagentv1.ApplyStatus) {

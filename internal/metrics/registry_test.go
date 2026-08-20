@@ -23,7 +23,13 @@ func TestRegistryExportsRequiredMetrics(t *testing.T) {
 		}},
 		fakeOutboxSource{stats: state.UsageOutboxStats{Batches: 7, PayloadBytes: 4096}},
 		fakeUsageSource{status: usage.CollectionStatus{LastSuccessAt: lastCollection}},
-		fakeObservationSource{lastPoll: lastPoll, reconcileErrors: 3},
+		fakeObservationSource{
+			lastPoll: lastPoll, reconcileErrors: 3,
+			reconciliation: service.ReconciliationStatus{
+				DesiredUsers: 4, AppliedUsers: 3, AppliedRules: 2, Drift: 3,
+				LastSuccessAt: lastPoll,
+			},
+		},
 	)
 	if err != nil {
 		t.Fatalf("New() вернул ошибку: %v", err)
@@ -46,6 +52,12 @@ func TestRegistryExportsRequiredMetrics(t *testing.T) {
 		"spirit_agent_usage_outbox_bytes 4096",
 		"spirit_agent_last_backend_poll_timestamp_seconds 1.78670880225e+09",
 		"spirit_agent_local_reconcile_errors_total 3",
+		"spirit_agent_desired_users 4",
+		"spirit_agent_desired_routing_rules 4",
+		"spirit_agent_applied_users 3",
+		"spirit_agent_applied_routing_rules 2",
+		"spirit_agent_state_drift 3",
+		"spirit_agent_last_successful_reconcile_timestamp_seconds 1.78670880225e+09",
 		"spirit_agent_needs_bootstrap 1",
 	} {
 		if !strings.Contains(response.Body.String(), line+"\n") {
@@ -173,6 +185,7 @@ func (source fakeUsageSource) Status() usage.CollectionStatus {
 type fakeObservationSource struct {
 	lastPoll        time.Time
 	reconcileErrors uint64
+	reconciliation  service.ReconciliationStatus
 }
 
 func (source fakeObservationSource) LastBackendPollAt() time.Time {
@@ -181,4 +194,8 @@ func (source fakeObservationSource) LastBackendPollAt() time.Time {
 
 func (source fakeObservationSource) LocalReconcileErrors() uint64 {
 	return source.reconcileErrors
+}
+
+func (source fakeObservationSource) Reconciliation() service.ReconciliationStatus {
+	return source.reconciliation
 }

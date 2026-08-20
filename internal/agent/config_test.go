@@ -28,6 +28,9 @@ func TestLoadConfigReturnsValidatedValuesAndDefaults(t *testing.T) {
 	if config.Xray.Address != defaultXrayAPIAddress || config.Xray.InboundTag != "public-vless" {
 		t.Fatalf("Xray config = %+v", config.Xray)
 	}
+	if config.XrayConfigPath != defaultXrayConfigPath {
+		t.Fatalf("Xray config path = %q", config.XrayConfigPath)
+	}
 	if config.FallbackOutboundTag != "block" ||
 		config.StateDatabasePath != defaultStateDatabasePath ||
 		config.MaximumInventoryUsers != 2000 || config.ShutdownTimeout != 10*time.Second {
@@ -46,6 +49,7 @@ func TestLoadConfigAppliesOptionalOverrides(t *testing.T) {
 	environment := validEnvironment()
 	environment[EnvLogLevel] = "warn"
 	environment[EnvXrayAPIAddress] = "[::1]:10086"
+	environment[EnvXrayConfigPath] = "/srv/xray/config.json"
 	environment[EnvFallbackOutboundTag] = "deny-all"
 	environment[EnvStateDatabasePath] = "/var/lib/custom-agent/state.db"
 	environment[EnvMaximumInventoryUsers] = "1500"
@@ -57,7 +61,8 @@ func TestLoadConfigAppliesOptionalOverrides(t *testing.T) {
 	}
 	if config.LogLevel != slog.LevelWarn || config.Xray.Address != "[::1]:10086" ||
 		config.FallbackOutboundTag != "deny-all" || config.MaximumInventoryUsers != 1500 ||
-		config.ShutdownTimeout != 25*time.Second || config.HTTPListenAddress != "[::1]:9091" {
+		config.ShutdownTimeout != 25*time.Second || config.HTTPListenAddress != "[::1]:9091" ||
+		config.XrayConfigPath != "/srv/xray/config.json" {
 		t.Fatalf("переопределённая конфигурация = %+v", config)
 	}
 }

@@ -104,7 +104,7 @@ func TestHealthWrapsServiceFailures(t *testing.T) {
 	}
 }
 
-func TestAddUserRuleBuildsAppendOnlyRoutingRule(t *testing.T) {
+func TestAddUserRulePrependsRuleBeforeDefaultDeny(t *testing.T) {
 	routing := &fakeRoutingClient{}
 	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
 
@@ -115,8 +115,8 @@ func TestAddUserRuleBuildsAppendOnlyRoutingRule(t *testing.T) {
 	if request == nil {
 		t.Fatal("AddRule не был вызван")
 	}
-	if !request.GetShouldAppend() {
-		t.Error("should_append=false, ожидалось true")
+	if request.GetShouldAppend() {
+		t.Error("should_append=true: персональное правило оказалось бы после default-deny")
 	}
 	if got := request.GetConfig().GetType(); got != "xray.app.router.Config" {
 		t.Fatalf("тип config = %q, ожидался xray.app.router.Config", got)

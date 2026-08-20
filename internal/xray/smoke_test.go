@@ -5,6 +5,7 @@ package xray
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,10 +20,7 @@ const smokeSecondAccountingID = "u.bcdefghijklmnopqrstu"
 const smokeSecondCredentialUUID = "22222222-2222-4222-8222-222222222222"
 
 func TestXrayAPISmoke(t *testing.T) {
-	configPath, err := filepath.Abs("testdata/smoke-config.json")
-	if err != nil {
-		t.Fatalf("получить путь конфигурации: %v", err)
-	}
+	configPath := durableSmokeConfig(t, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -143,6 +141,78 @@ func TestXrayAPISmoke(t *testing.T) {
 	assertSmokeUserAbsent(t, ctx, client, smokeSecondAccountingID)
 }
 
+func TestXrayFileStateSurvivesRestart(t *testing.T) {
+	desired := User{
+		AccountingID: testAccountingID, CredentialUUID: testCredentialUUID, Flow: flowVision,
+	}
+	configPath := durableSmokeConfig(t, []PersistentUser{{
+		User: desired, OutboundTag: "direct",
+	}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	containerID := dockerOutput(
+		t, ctx, "run", "--rm", "--detach", "--publish", "127.0.0.1::10085",
+		"--volume", configPath+":/usr/local/etc/xray/config.json:ro",
+		smokeImage, "-config", "/usr/local/etc/xray/config.json",
+	)
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer stopCancel()
+		_ = exec.CommandContext(stopCtx, "docker", "rm", "--force", containerID).Run()
+	})
+	address := dockerOutput(t, ctx, "port", containerID, "10085/tcp")
+	client, err := New(Config{Address: address, InboundTag: "vless-in"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	assertPersistentSmokeState(t, ctx, client, desired)
+
+	dockerOutput(t, ctx, "restart", containerID)
+	waitForXray(t, ctx, client)
+	assertPersistentSmokeState(t, ctx, client, desired)
+}
+
+func assertPersistentSmokeState(t *testing.T, ctx context.Context, client *Client, desired User) {
+	t.Helper()
+	waitForXray(t, ctx, client)
+	if got := smokeUser(t, ctx, client, desired.AccountingID); got != desired {
+		t.Fatalf("persistent user = %+v, want %+v", got, desired)
+	}
+	if outbound := testSmokeRoute(t, ctx, client, desired.AccountingID); outbound != "direct" {
+		t.Fatalf("persistent route = %q, want direct", outbound)
+	}
+	rules, err := client.UserRules(ctx)
+	if err != nil || len(rules) != 1 || rules[0].AccountingID != desired.AccountingID {
+		t.Fatalf("persistent rules = %+v, error=%v", rules, err)
+	}
+}
+
+func durableSmokeConfig(t *testing.T, desired []PersistentUser) string {
+	t.Helper()
+	source, err := filepath.Abs("testdata/smoke-config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := NewConfigFile(configPath, "vless-in", "block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := configuration.Reconcile(context.Background(), desired); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
+}
+
 func waitForXray(t *testing.T, ctx context.Context, client *Client) {
 	t.Helper()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -185,9 +255,9 @@ func assertSmokeNoRoute(
 	accountingID string,
 ) {
 	t.Helper()
-	_, err := client.TestUserRoute(ctx, accountingID)
-	if !errors.Is(err, ErrRouteNotFound) {
-		t.Fatalf("TestRoute без правила вернул %v, ожидалась ErrRouteNotFound", err)
+	outbound, err := client.TestUserRoute(ctx, accountingID)
+	if err != nil || outbound != "block" {
+		t.Fatalf("TestRoute без персонального правила = %q, error=%v; ожидался block", outbound, err)
 	}
 }
 

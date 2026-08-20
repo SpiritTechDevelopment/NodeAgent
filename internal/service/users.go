@@ -37,6 +37,12 @@ type XrayUserController interface {
 	TestUserRoute(context.Context, string) (string, error)
 }
 
+// XrayConfigWriter persists the complete agent-owned desired state in the
+// startup configuration consumed by Xray after a restart.
+type XrayConfigWriter interface {
+	Reconcile(context.Context, []xray.PersistentUser) error
+}
+
 // UsageFinalizer сохраняет и сбрасывает остаток трафика пользователей.
 // Сервис вызывает её под блокировкой пользовательских мутаций, а реализация
 // обязана сериализовать точечные и полные сбросы со своим периодическим сбором.
@@ -89,6 +95,12 @@ func (s *Service) EnsureUserPresent(
 	); err != nil {
 		return retryableResult(operationID, stateFailureMessage), nil
 	}
+	if err := s.storePresentIntent(ctx, desired, false); err != nil {
+		return retryableResult(operationID, stateFailureMessage), nil
+	}
+	if err := s.persistManagedConfig(ctx); err != nil {
+		return retryableResult(operationID, xrayFailureMessage), nil
+	}
 
 	observed, err := s.observeUser(ctx, desired.AccountingID)
 	if err != nil {
@@ -112,9 +124,6 @@ func (s *Service) EnsureUserPresent(
 		if err := s.usage.FinalizeUser(ctx, desired.AccountingID); err != nil {
 			return retryableResult(operationID, usageFailureMessage), nil
 		}
-	}
-	if err := s.storePresentIntent(ctx, desired, false); err != nil {
-		return retryableResult(operationID, stateFailureMessage), nil
 	}
 	if err := s.applyPresent(ctx, observed, desired, resolvedOutbound); err != nil {
 		return retryableResult(operationID, xrayFailureMessage), nil
@@ -191,6 +200,12 @@ func (s *Service) EnsureUserAbsent(
 		return retryableResult(operationID, stateFailureMessage), nil
 	}
 	if observed.user == nil && observed.rule == nil {
+		if err := s.storeAbsentIntent(ctx, tombstone, false); err != nil {
+			return retryableResult(operationID, stateFailureMessage), nil
+		}
+		if err := s.persistManagedConfig(ctx); err != nil {
+			return retryableResult(operationID, xrayFailureMessage), nil
+		}
 		return s.completeAbsent(
 			ctx,
 			operationID,
@@ -207,6 +222,9 @@ func (s *Service) EnsureUserAbsent(
 	}
 	if err := s.storeAbsentIntent(ctx, tombstone, false); err != nil {
 		return retryableResult(operationID, stateFailureMessage), nil
+	}
+	if err := s.persistManagedConfig(ctx); err != nil {
+		return retryableResult(operationID, xrayFailureMessage), nil
 	}
 	if observed.user != nil {
 		if err := s.xray.RemoveUser(ctx, accountingID); err != nil {
@@ -404,6 +422,38 @@ func (s *Service) storeAbsentIntent(
 	user.Applied = applied
 	user.UpdatedAt = s.now().UTC()
 	return s.state.PutManagedUser(ctx, user)
+}
+
+func (s *Service) persistManagedConfig(ctx context.Context) error {
+	managed, err := s.state.ManagedUsers(ctx)
+	if err != nil {
+		return err
+	}
+	desired := make([]xray.PersistentUser, 0, len(managed))
+	for _, user := range managed {
+		if !user.DesiredPresent {
+			continue
+		}
+		resolved, err := s.desiredFromManagedUser(user)
+		if err != nil {
+			return err
+		}
+		desired = append(desired, xray.PersistentUser{
+			User: xray.User{
+				AccountingID:   user.AccountingID,
+				CredentialUUID: user.CredentialUUID,
+				Flow:           user.Flow,
+			},
+			OutboundTag: resolved.resolvedOutbound,
+		})
+	}
+	return s.xrayConfig.Reconcile(ctx, desired)
+}
+
+func (s *Service) persistManagedConfigSafely(ctx context.Context) error {
+	s.mutations.Lock()
+	defer s.mutations.Unlock()
+	return s.persistManagedConfig(ctx)
 }
 
 func (s *Service) completePresent(

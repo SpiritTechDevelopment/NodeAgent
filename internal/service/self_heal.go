@@ -20,8 +20,8 @@ var (
 	ErrSelfHealAlreadyRunning = errors.New("local self-heal is already running")
 )
 
-// RunSelfHeal запускает локальный recovery, периодический add-only аудит и
-// внеочередной аудит после обнаружения рестарта Xray.
+// RunSelfHeal starts immediately, retries readiness failures with bounded
+// backoff, audits periodically, and audits again after an observed Xray restart.
 func (s *Service) RunSelfHeal(ctx context.Context, report func(error)) error {
 	if !s.selfHealRunning.CompareAndSwap(false, true) {
 		return ErrSelfHealAlreadyRunning
@@ -39,33 +39,45 @@ func (s *Service) RunSelfHeal(ctx context.Context, report func(error)) error {
 	var (
 		previousStatus XrayStatus
 		statusObserved bool
-		nextAudit      time.Time
+		nextAttempt    time.Time
+		retryDelay     = s.xrayProbeInterval
 	)
 	for {
 		now := s.now().UTC()
-		snapshot, err := s.status.Status(ctx)
-		due := nextAudit.IsZero() || !now.Before(nextAudit)
-		if err != nil {
-			err = errors.New("node status is unavailable for local self-heal")
-			previousStatus = XrayStatus{}
-			statusObserved = true
-			if due {
-				nextAudit = now.Add(s.selfHealInterval)
-			} else {
-				err = nil
-			}
-		} else {
-			restarted := statusObserved && xrayRestarted(previousStatus, snapshot.Xray)
-			if snapshot.Xray.Reachable && (due || restarted) {
+		snapshot, statusErr := s.status.Status(ctx)
+		restarted := statusErr == nil && statusObserved && xrayRestarted(previousStatus, snapshot.Xray)
+		due := nextAttempt.IsZero() || !now.Before(nextAttempt)
+		var err error
+		if due || restarted {
+			switch {
+			case statusErr != nil:
+				err = errors.Join(
+					errors.New("node status is unavailable for local self-heal"),
+					s.persistManagedConfigSafely(ctx),
+				)
+			case !snapshot.Xray.Reachable:
+				err = errors.Join(
+					errors.New("Xray is unavailable for local self-heal"),
+					s.persistManagedConfigSafely(ctx),
+				)
+			default:
 				err = s.recoverAndAudit(ctx)
-				nextAudit = now.Add(s.selfHealInterval)
-			} else if due {
-				err = errors.New("Xray is unavailable for local self-heal")
-				nextAudit = now.Add(s.selfHealInterval)
 			}
-			previousStatus = snapshot.Xray
-			statusObserved = true
+			if err == nil {
+				retryDelay = s.xrayProbeInterval
+				nextAttempt = now.Add(s.selfHealInterval)
+			} else {
+				nextAttempt = now.Add(retryDelay)
+				retryDelay = min(retryDelay*2, s.selfHealInterval)
+				s.recordUnavailableReconciliation(ctx)
+			}
 		}
+		if statusErr != nil {
+			previousStatus = XrayStatus{}
+		} else {
+			previousStatus = snapshot.Xray
+		}
+		statusObserved = true
 		if err != nil && ctx.Err() == nil {
 			s.localReconcileErrs.Add(1)
 			if report != nil {
@@ -201,6 +213,9 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 func (s *Service) auditManagedUsers(ctx context.Context) error {
 	s.mutations.Lock()
 	defer s.mutations.Unlock()
+	if err := s.persistManagedConfig(ctx); err != nil {
+		return err
+	}
 
 	users, err := s.state.ManagedUsers(ctx)
 	if err != nil {
@@ -223,27 +238,13 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 		}
 		desiredUsers = append(desiredUsers, desired)
 		observed := runtimeUser(runtime, user.AccountingID)
-		if observed.user != nil &&
-			(observed.user.CredentialUUID != user.CredentialUUID || observed.user.Flow != user.Flow) {
+		matches, err := s.presentMatches(ctx, observed, user, desired.resolvedOutbound)
+		if err != nil {
 			hadFailure = true
 			continue
 		}
-		if observed.rule != nil && observed.rule.OutboundTag != desired.resolvedOutbound {
-			hadFailure = true
-			continue
-		}
-		if observed.user == nil {
-			if err := s.xray.AddUser(ctx, xray.User{
-				AccountingID:   user.AccountingID,
-				CredentialUUID: user.CredentialUUID,
-				Flow:           user.Flow,
-			}); err != nil {
-				hadFailure = true
-				continue
-			}
-		}
-		if observed.rule == nil {
-			if err := s.xray.AddUserRule(ctx, user.AccountingID, desired.resolvedOutbound); err != nil {
+		if !matches {
+			if err := s.applyPresent(ctx, observed, user, desired.resolvedOutbound); err != nil {
 				hadFailure = true
 				continue
 			}
@@ -258,10 +259,66 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 			hadFailure = true
 		}
 	}
+	s.recordReconciliation(ctx, desiredUsers, verified, !hadFailure)
 	if hadFailure {
-		return errors.New("add-only Xray audit did not converge")
+		return errors.New("Xray audit did not converge")
 	}
-	return s.state.SetLastXrayAuditAt(ctx, s.now().UTC())
+	observedAt := s.now().UTC()
+	if err := s.state.SetLastXrayAuditAt(ctx, observedAt); err != nil {
+		return err
+	}
+	status := s.Reconciliation()
+	status.LastSuccessAt = observedAt
+	s.reconciliation.Store(&status)
+	return nil
+}
+
+func (s *Service) recordReconciliation(
+	ctx context.Context,
+	desired []reconcileDesiredUser,
+	runtime reconcileRuntime,
+	success bool,
+) {
+	status := ReconciliationStatus{DesiredUsers: uint64(len(desired))}
+	previous := s.Reconciliation()
+	status.LastSuccessAt = previous.LastSuccessAt
+	for _, item := range desired {
+		observed := runtimeUser(runtime, item.user.AccountingID)
+		if observed.user != nil && observed.user.CredentialUUID == item.user.CredentialUUID &&
+			observed.user.Flow == item.user.Flow {
+			status.AppliedUsers++
+		}
+		if observed.rule != nil && observed.rule.OutboundTag == item.resolvedOutbound {
+			outbound, err := s.xray.TestUserRoute(ctx, item.user.AccountingID)
+			if err == nil && outbound == item.resolvedOutbound {
+				status.AppliedRules++
+			}
+		}
+	}
+	status.Drift = status.DesiredUsers*2 - status.AppliedUsers - status.AppliedRules
+	if success {
+		status.Drift = 0
+	}
+	s.reconciliation.Store(&status)
+}
+
+func (s *Service) recordUnavailableReconciliation(ctx context.Context) {
+	users, err := s.state.ManagedUsers(ctx)
+	if err != nil {
+		return
+	}
+	var desired uint64
+	for _, user := range users {
+		if user.DesiredPresent {
+			desired++
+		}
+	}
+	previous := s.Reconciliation()
+	s.reconciliation.Store(&ReconciliationStatus{
+		DesiredUsers:  desired,
+		Drift:         desired * 2,
+		LastSuccessAt: previous.LastSuccessAt,
+	})
 }
 
 func (s *Service) desiredFromManagedUser(user state.ManagedUser) (reconcileDesiredUser, error) {

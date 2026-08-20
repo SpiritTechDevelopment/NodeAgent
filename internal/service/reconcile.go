@@ -103,6 +103,9 @@ func (s *Service) ReconcileUsers(
 	if err := s.storeReconcileIntents(ctx, intents); err != nil {
 		return retryableReconcile(operationID, stateFailureMessage), nil
 	}
+	if err := s.persistManagedConfig(ctx); err != nil {
+		return retryableReconcile(operationID, xrayFailureMessage), nil
+	}
 
 	for index := range plans {
 		if plans[index].action == reconcileUnchanged {

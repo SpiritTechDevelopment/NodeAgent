@@ -46,6 +46,8 @@ type Dependencies struct {
 	State *state.Store
 	// Xray управляет пользователями и их персональными правилами.
 	Xray XrayUserController
+	// XrayConfig сохраняет тот же desired state в стартовом config.json Xray.
+	XrayConfig XrayConfigWriter
 	// Usage сохраняет остаток трафика перед заменой или удалением пользователя.
 	Usage UsageFinalizer
 }
@@ -62,12 +64,14 @@ type Service struct {
 	status              StatusProvider
 	state               *state.Store
 	xray                XrayUserController
+	xrayConfig          XrayConfigWriter
 	usage               UsageFinalizer
 	mutations           sync.Mutex
 	reconciling         atomic.Bool
 	selfHealRunning     atomic.Bool
 	lastBackendPoll     atomic.Int64
 	localReconcileErrs  atomic.Uint64
+	reconciliation      atomic.Pointer[ReconciliationStatus]
 	selfHealInterval    time.Duration
 	xrayProbeInterval   time.Duration
 	now                 func() time.Time
@@ -85,6 +89,24 @@ func (s *Service) LastBackendPollAt() time.Time {
 // LocalReconcileErrors возвращает число ошибок локального self-heal.
 func (s *Service) LocalReconcileErrors() uint64 {
 	return s.localReconcileErrs.Load()
+}
+
+// ReconciliationStatus is a lock-free snapshot exported to Prometheus.
+type ReconciliationStatus struct {
+	DesiredUsers  uint64
+	AppliedUsers  uint64
+	AppliedRules  uint64
+	Drift         uint64
+	LastSuccessAt time.Time
+}
+
+// Reconciliation returns the most recently observed desired/runtime comparison.
+func (s *Service) Reconciliation() ReconciliationStatus {
+	value := s.reconciliation.Load()
+	if value == nil {
+		return ReconciliationStatus{}
+	}
+	return *value
 }
 
 // New проверяет config и создаёт прикладной сервис агента ноды.
@@ -127,8 +149,11 @@ func New(config Config, dependencies Dependencies) (*Service, error) {
 	if dependencies.Usage == nil {
 		return nil, errors.New("usage finalizer is required")
 	}
+	if dependencies.XrayConfig == nil {
+		return nil, errors.New("Xray config writer is required")
+	}
 
-	return &Service{
+	result := &Service{
 		nodeID:              nodeID,
 		agentVersion:        agentVersion,
 		localOutboundTag:    localOutboundTag,
@@ -137,11 +162,14 @@ func New(config Config, dependencies Dependencies) (*Service, error) {
 		status:              dependencies.Status,
 		state:               dependencies.State,
 		xray:                dependencies.Xray,
+		xrayConfig:          dependencies.XrayConfig,
 		usage:               dependencies.Usage,
 		selfHealInterval:    defaultSelfHealInterval,
 		xrayProbeInterval:   defaultXrayProbeInterval,
 		now:                 time.Now,
-	}, nil
+	}
+	result.reconciliation.Store(&ReconciliationStatus{})
+	return result, nil
 }
 
 // Health возвращает текущее состояние готовности без обращения к backend.

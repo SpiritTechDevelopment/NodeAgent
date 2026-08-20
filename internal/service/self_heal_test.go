@@ -136,7 +136,7 @@ func TestAuditManagedUsersIsStrictlyAddOnly(t *testing.T) {
 	}
 }
 
-func TestAuditManagedUsersDoesNotReplaceConflictingRuntime(t *testing.T) {
+func TestAuditManagedUsersRepairsConflictingRuntime(t *testing.T) {
 	service, store, runtime, _ := newUserTestService(t)
 	if err := store.PutManagedUser(context.Background(), state.ManagedUser{
 		AccountingID:   testAccountingID,
@@ -156,18 +156,19 @@ func TestAuditManagedUsersDoesNotReplaceConflictingRuntime(t *testing.T) {
 		OutboundTag:  "unexpected-egress",
 	}
 
-	if err := service.auditManagedUsers(context.Background()); err == nil {
-		t.Fatal("auditManagedUsers() не сообщил о конфликтующем runtime")
+	if err := service.auditManagedUsers(context.Background()); err != nil {
+		t.Fatalf("auditManagedUsers() error = %v", err)
 	}
-	if runtime.mutationCount() != 0 {
-		t.Fatalf("add-only аудит заменил конфликтующий runtime: %v", runtime.calls)
+	if runtime.mutationCount() == 0 {
+		t.Fatalf("аудит не исправил конфликтующий runtime: %v", runtime.calls)
 	}
-	if runtime.users[testAccountingID].CredentialUUID != secondCredential {
-		t.Fatal("конфликтующий credential был изменён")
+	if runtime.users[testAccountingID].CredentialUUID != testCredentialUUID ||
+		runtime.rules[testAccountingID].OutboundTag != "direct" {
+		t.Fatalf("runtime не сошёлся: user=%+v rule=%+v", runtime.users[testAccountingID], runtime.rules[testAccountingID])
 	}
 	metadata, err := store.Metadata(context.Background())
-	if err != nil || !metadata.LastXrayAuditAt.IsZero() {
-		t.Fatalf("неуспешный аудит записал время: %v, error=%v", metadata.LastXrayAuditAt, err)
+	if err != nil || metadata.LastXrayAuditAt.IsZero() {
+		t.Fatalf("успешный аудит не записал время: %v, error=%v", metadata.LastXrayAuditAt, err)
 	}
 }
 
@@ -276,6 +277,41 @@ func TestRunSelfHealCountsReportedErrors(t *testing.T) {
 	}
 	if got := service.LocalReconcileErrors(); got != 1 {
 		t.Fatalf("LocalReconcileErrors() = %d, ожидалось 1", got)
+	}
+}
+
+func TestRunSelfHealRetriesUntilXrayBecomesReady(t *testing.T) {
+	provider := &atomicStatusProvider{}
+	dependencies := newTestDependencies(t, provider)
+	service, err := New(
+		Config{NodeID: "node-test", AgentVersion: "test", LocalOutboundTag: "direct"},
+		dependencies,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.selfHealInterval = time.Hour
+	service.xrayProbeInterval = 2 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reported := make(chan error, 4)
+	done := make(chan error, 1)
+	go func() { done <- service.RunSelfHeal(ctx, func(err error) { reported <- err }) }()
+	select {
+	case <-reported:
+	case <-time.After(time.Second):
+		t.Fatal("self-heal did not report initial unavailable Xray")
+	}
+	provider.reachable.Store(true)
+	provider.uptimeNanos.Store(int64(time.Second))
+	waitForAuditAfter(t, dependencies.State, time.Time{})
+	status := service.Reconciliation()
+	if status.LastSuccessAt.IsZero() || status.Drift != 0 {
+		t.Fatalf("reconciliation status after readiness = %+v", status)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

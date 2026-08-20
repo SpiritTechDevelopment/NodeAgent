@@ -34,6 +34,7 @@ type usageSource interface {
 type observationSource interface {
 	LastBackendPollAt() time.Time
 	LocalReconcileErrors() uint64
+	Reconciliation() service.ReconciliationStatus
 }
 
 // Registry хранит Prometheus-метрики и обновляет снимки локальных зависимостей.
@@ -112,6 +113,32 @@ func New(
 	}, func() float64 {
 		return float64(result.observations.LocalReconcileErrors())
 	})
+	desiredUsers := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "desired_users",
+		Help: "Expected number of backend-owned users in Xray.",
+	}, func() float64 { return float64(result.observations.Reconciliation().DesiredUsers) })
+	desiredRules := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "desired_routing_rules",
+		Help: "Expected number of per-user routing rules in Xray.",
+	}, func() float64 { return float64(result.observations.Reconciliation().DesiredUsers) })
+	appliedUsers := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "applied_users",
+		Help: "Number of desired users matching the observed Xray runtime.",
+	}, func() float64 { return float64(result.observations.Reconciliation().AppliedUsers) })
+	appliedRules := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "applied_routing_rules",
+		Help: "Number of desired per-user routes selected by Xray.",
+	}, func() float64 { return float64(result.observations.Reconciliation().AppliedRules) })
+	stateDrift := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "state_drift",
+		Help: "Number of missing or mismatched desired users and routing rules.",
+	}, func() float64 { return float64(result.observations.Reconciliation().Drift) })
+	lastSuccessfulReconcile := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: "spirit", Subsystem: "agent", Name: "last_successful_reconcile_timestamp_seconds",
+		Help: "Unix time of the last successful desired/runtime reconciliation.",
+	}, func() float64 {
+		return timestampSeconds(result.observations.Reconciliation().LastSuccessAt)
+	})
 	result.registry.MustRegister(
 		result.agentUp,
 		result.xrayUp,
@@ -120,6 +147,12 @@ func New(
 		result.usageOutboxBytes,
 		lastBackendPoll,
 		localReconcileErrors,
+		desiredUsers,
+		desiredRules,
+		appliedUsers,
+		appliedRules,
+		stateDrift,
+		lastSuccessfulReconcile,
 		result.needsBootstrap,
 	)
 	return result, nil

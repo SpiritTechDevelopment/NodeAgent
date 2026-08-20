@@ -27,7 +27,8 @@ func UserRuleTag(accountingID string) (string, error) {
 	return userRuleTagPrefix + accountingID, nil
 }
 
-// AddUserRule добавляет персональное правило в конец текущего списка правил Xray.
+// AddUserRule добавляет персональное правило в начало списка правил Xray, чтобы
+// оно всегда находилось перед завершающим default-deny для клиентского inbound.
 func (c *Client) AddUserRule(
 	ctx context.Context,
 	accountingID string,
@@ -52,7 +53,7 @@ func (c *Client) AddUserRule(
 	})
 	if _, err := c.routing.AddRule(ctx, &routerCommand.AddRuleRequest{
 		Config:       configuration,
-		ShouldAppend: true,
+		ShouldAppend: false,
 	}); err != nil {
 		return fmt.Errorf("add Xray user routing rule: %w", err)
 	}

@@ -26,6 +26,7 @@ const (
 	EnvGRPCClientIdentities  = "SPIRIT_GRPC_ALLOWED_CLIENT_IDENTITIES"
 	EnvXrayAPIAddress        = "SPIRIT_XRAY_API_ADDRESS"
 	EnvXrayInboundTag        = "SPIRIT_XRAY_INBOUND_TAG"
+	EnvXrayConfigPath        = "SPIRIT_XRAY_CONFIG_PATH"
 	EnvLocalOutboundTag      = "SPIRIT_XRAY_LOCAL_OUTBOUND_TAG"
 	EnvFallbackOutboundTag   = "SPIRIT_XRAY_FALLBACK_OUTBOUND_TAG"
 	EnvStateDatabasePath     = "SPIRIT_STATE_DB_PATH"
@@ -37,6 +38,7 @@ const (
 	defaultLogLevel              = "info"
 	defaultHTTPListenAddress     = "127.0.0.1:9090"
 	defaultXrayAPIAddress        = "127.0.0.1:10085"
+	defaultXrayConfigPath        = "/opt/vpn/xray/config.json"
 	defaultFallbackOutboundTag   = "block"
 	defaultStateDatabasePath     = "/var/lib/spirit-agent/state.db"
 	defaultMaximumInventoryUsers = 2000
@@ -66,6 +68,8 @@ type Config struct {
 	GRPC grpcserver.Config
 	// Xray задаёт адрес локального API и клиентский inbound.
 	Xray xray.Config
+	// XrayConfigPath contains the writable startup configuration reconciled by the agent.
+	XrayConfigPath string
 	// LocalOutboundTag содержит outbound локального FREEDOM-выхода.
 	LocalOutboundTag string
 	// FallbackOutboundTag содержит безопасный outbound по умолчанию.
@@ -125,6 +129,7 @@ func LoadConfig(getenv func(string) string, version string) (Config, error) {
 		Address:    value(getenv, EnvXrayAPIAddress, defaultXrayAPIAddress),
 		InboundTag: required(getenv, EnvXrayInboundTag, &errs),
 	}
+	config.XrayConfigPath = value(getenv, EnvXrayConfigPath, defaultXrayConfigPath)
 	config.LocalOutboundTag = required(getenv, EnvLocalOutboundTag, &errs)
 	config.FallbackOutboundTag = value(getenv, EnvFallbackOutboundTag, defaultFallbackOutboundTag)
 	config.StateDatabasePath = value(getenv, EnvStateDatabasePath, defaultStateDatabasePath)

@@ -89,6 +89,14 @@ func New(ctx context.Context, config Config, logger *slog.Logger) (*App, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create Xray client: %w", err)
 	}
+	xrayConfig, err := xray.NewConfigFile(
+		config.XrayConfigPath,
+		config.Xray.InboundTag,
+		config.FallbackOutboundTag,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("open durable Xray config: %w", err)
+	}
 	closeXray := true
 	defer func() {
 		if closeXray {
@@ -111,10 +119,11 @@ func New(ctx context.Context, config Config, logger *slog.Logger) (*App, error) 
 		FallbackOutboundTag: config.FallbackOutboundTag,
 		MaxInventoryUsers:   config.MaximumInventoryUsers,
 	}, service.Dependencies{
-		Status: status,
-		State:  store,
-		Xray:   xrayClient,
-		Usage:  collector,
+		Status:     status,
+		State:      store,
+		Xray:       xrayClient,
+		XrayConfig: xrayConfig,
+		Usage:      collector,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create application service: %w", err)

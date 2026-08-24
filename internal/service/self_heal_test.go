@@ -239,14 +239,6 @@ func TestSelfHealErrorsIncludeAccountingIDAndRPC(t *testing.T) {
 	}{
 		{name: "add user", failMethod: "AddUser", wantRPC: "HandlerService.AddUser"},
 		{
-			name: "add rule", failMethod: "AddUserRule", wantRPC: "RoutingService.AddRule",
-			prepare: func(runtime *fakeXrayController) {
-				runtime.users[testAccountingID] = xray.User{
-					AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
-				}
-			},
-		},
-		{
 			name: "test route", failMethod: "TestUserRoute", wantRPC: "RoutingService.TestRoute",
 			prepare: func(runtime *fakeXrayController) {
 				runtime.users[testAccountingID] = xray.User{
@@ -262,17 +254,6 @@ func TestSelfHealErrorsIncludeAccountingIDAndRPC(t *testing.T) {
 			prepare: func(runtime *fakeXrayController) {
 				runtime.users[testAccountingID] = xray.User{
 					AccountingID: testAccountingID, CredentialUUID: secondCredential,
-				}
-			},
-		},
-		{
-			name: "remove rule", failMethod: "RemoveUserRule", wantRPC: "RoutingService.RemoveRule",
-			prepare: func(runtime *fakeXrayController) {
-				runtime.users[testAccountingID] = xray.User{
-					AccountingID: testAccountingID, CredentialUUID: testCredentialUUID,
-				}
-				runtime.rules[testAccountingID] = xray.UserRule{
-					AccountingID: testAccountingID, OutboundTag: "wrong",
 				}
 			},
 		},

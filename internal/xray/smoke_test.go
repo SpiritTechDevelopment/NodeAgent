@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	routerCommand "github.com/xtls/xray-core/app/router/command"
 )
 
 const smokeImage = "ghcr.io/xtls/xray-core:26.3.27"
@@ -92,22 +95,24 @@ func TestXrayAPISmoke(t *testing.T) {
 	}
 
 	assertSmokeNoRoute(t, ctx, client, testAccountingID)
-	if err := client.AddUserRule(ctx, testAccountingID, "direct"); err != nil {
-		t.Fatalf("добавить правило FREEDOM: %v", err)
+
+	file, err := NewConfigFile(configPath, "vless-in", "block")
+	if err != nil {
+		t.Fatalf("открыть конфигурацию: %v", err)
 	}
+	applySmokeRouting(t, ctx, client, file, []PersistentUser{
+		{User: firstUser, OutboundTag: "direct"},
+		{User: secondUser, OutboundTag: "bridge-test"},
+	})
+
+	// Регрессия: раньше правило слалось по одному с ShouldAppend=false, из-за чего
+	// установка второго стирала первое, правило api и default-deny.
 	if outbound := testSmokeRoute(t, ctx, client, testAccountingID); outbound != "direct" {
-		t.Fatalf("outbound после добавления = %q, ожидался direct", outbound)
-	}
-	if err := client.AddUserRule(ctx, smokeSecondAccountingID, "bridge-test"); err != nil {
-		t.Fatalf("добавить правило BRIDGE: %v", err)
-	}
-	if outbound := testSmokeRoute(t, ctx, client, testAccountingID); outbound != "direct" {
-		t.Fatalf("первое правило после второго выбрало %q, ожидался direct", outbound)
+		t.Fatalf("первый пользователь выбрал %q, ожидался direct", outbound)
 	}
 	if outbound := testSmokeRoute(t, ctx, client, smokeSecondAccountingID); outbound != "bridge-test" {
 		t.Fatalf("BRIDGE outbound = %q, ожидался bridge-test", outbound)
 	}
-
 	rules, err := client.UserRules(ctx)
 	if err != nil {
 		t.Fatalf("прочитать правила: %v", err)
@@ -119,10 +124,12 @@ func TestXrayAPISmoke(t *testing.T) {
 		rules[1].OutboundTag != "bridge-test" {
 		t.Fatalf("персональные правила = %+v, ожидались правила direct и bridge-test", rules)
 	}
+	assertSmokeForeignRulesSurvive(t, ctx, client, len(rules))
 
-	if err := client.RemoveUserRule(ctx, testAccountingID); err != nil {
-		t.Fatalf("удалить правило: %v", err)
-	}
+	// Снятие пользователя — тоже переустановка таблицы, уже без него.
+	applySmokeRouting(t, ctx, client, file, []PersistentUser{
+		{User: secondUser, OutboundTag: "bridge-test"},
+	})
 	assertSmokeNoRoute(t, ctx, client, testAccountingID)
 	if err := client.RemoveUser(ctx, testAccountingID); err != nil {
 		t.Fatalf("удалить первого VLESS-пользователя: %v", err)
@@ -131,14 +138,63 @@ func TestXrayAPISmoke(t *testing.T) {
 	if outbound := testSmokeRoute(t, ctx, client, smokeSecondAccountingID); outbound != "bridge-test" {
 		t.Fatalf("второе правило после удаления первого выбрало %q", outbound)
 	}
-	if err := client.RemoveUserRule(ctx, smokeSecondAccountingID); err != nil {
-		t.Fatalf("удалить второе правило: %v", err)
-	}
+
+	applySmokeRouting(t, ctx, client, file, nil)
 	assertSmokeNoRoute(t, ctx, client, smokeSecondAccountingID)
 	if err := client.RemoveUser(ctx, smokeSecondAccountingID); err != nil {
 		t.Fatalf("удалить второго VLESS-пользователя: %v", err)
 	}
 	assertSmokeUserAbsent(t, ctx, client, smokeSecondAccountingID)
+}
+
+// applySmokeRouting повторяет боевой путь агента: записать желаемое состояние в
+// конфигурацию и установить собранную из неё таблицу в работающий Xray.
+func applySmokeRouting(
+	t *testing.T,
+	ctx context.Context,
+	client *Client,
+	file *ConfigFile,
+	desired []PersistentUser,
+) {
+	t.Helper()
+	if err := file.Reconcile(ctx, desired); err != nil {
+		t.Fatalf("записать желаемое состояние: %v", err)
+	}
+	table, err := file.DesiredRouting()
+	if err != nil {
+		t.Fatalf("собрать таблицу маршрутизации: %v", err)
+	}
+	if err := client.ApplyRouting(ctx, table); err != nil {
+		t.Fatalf("установить таблицу маршрутизации: %v", err)
+	}
+}
+
+// assertSmokeForeignRulesSurvive проверяет, что установка таблицы сохранила
+// правила, которыми агент не владеет: правило api и завершающий default-deny.
+// Без них Xray отправил бы и служебный трафик, и трафик неизвестных клиентов в
+// первый outbound конфигурации — в smoke-фикстуре это blackhole.
+func assertSmokeForeignRulesSurvive(
+	t *testing.T,
+	ctx context.Context,
+	client *Client,
+	userRules int,
+) {
+	t.Helper()
+	response, err := client.routing.ListRule(ctx, &routerCommand.ListRuleRequest{})
+	if err != nil {
+		t.Fatalf("прочитать полную таблицу: %v", err)
+	}
+	tags := make([]string, 0, len(response.GetRules()))
+	for _, rule := range response.GetRules() {
+		tags = append(tags, rule.GetRuleTag())
+	}
+	// правило api + персональные правила + default-deny
+	if len(tags) != userRules+2 {
+		t.Fatalf("таблица = %v, ожидались api, %d персональных и default-deny", tags, userRules)
+	}
+	if !slices.Contains(tags, defaultDenyRuleTagPrefix+"vless-in") {
+		t.Fatalf("default-deny исчез из таблицы: %v", tags)
+	}
 }
 
 func TestXrayFileStateSurvivesRestart(t *testing.T) {

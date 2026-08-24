@@ -103,7 +103,7 @@ func (s *Service) ReconcileUsers(
 	if err := s.storeReconcileIntents(ctx, intents); err != nil {
 		return retryableReconcile(operationID, stateFailureMessage), nil
 	}
-	if err := s.persistManagedConfig(ctx); err != nil {
+	if err := s.applyManagedConfig(ctx); err != nil {
 		return retryableReconcile(operationID, xrayFailureMessage), nil
 	}
 
@@ -126,7 +126,8 @@ func (s *Service) ReconcileUsers(
 		if plans[index].action != reconcileUnchanged {
 			return retryableReconcile(operationID, xrayFailureMessage), nil
 		}
-		if err := s.replaceReconcileRule(ctx, plans[index].desired); err != nil {
+		// Точечно исправить одно правило нельзя: переустанавливаем таблицу целиком.
+		if err := s.reinstallRouting(ctx); err != nil {
 			return retryableReconcile(operationID, xrayFailureMessage), nil
 		}
 		outbound, err = s.xray.TestUserRoute(ctx, plans[index].desired.user.AccountingID)
@@ -140,13 +141,9 @@ func (s *Service) ReconcileUsers(
 
 	for _, accountingID := range sortedKeys(removals) {
 		observed := removals[accountingID]
+		// Правила снятых пользователей уже убраны applyManagedConfig.
 		if observed.user != nil {
 			if err := s.xray.RemoveUser(ctx, accountingID); err != nil {
-				return retryableReconcile(operationID, xrayFailureMessage), nil
-			}
-		}
-		if observed.rule != nil {
-			if err := s.xray.RemoveUserRule(ctx, accountingID); err != nil {
 				return retryableReconcile(operationID, xrayFailureMessage), nil
 			}
 		}
@@ -347,22 +344,8 @@ func (s *Service) applyReconcilePresent(ctx context.Context, plan reconcilePlan)
 			return err
 		}
 	}
-	if plan.observed.rule != nil && plan.observed.rule.OutboundTag == desired.resolvedOutbound {
-		return nil
-	}
-	if plan.observed.rule != nil {
-		if err := s.xray.RemoveUserRule(ctx, desired.user.AccountingID); err != nil {
-			return err
-		}
-	}
-	return s.xray.AddUserRule(ctx, desired.user.AccountingID, desired.resolvedOutbound)
-}
-
-func (s *Service) replaceReconcileRule(ctx context.Context, desired reconcileDesiredUser) error {
-	if err := s.xray.RemoveUserRule(ctx, desired.user.AccountingID); err != nil {
-		return err
-	}
-	return s.xray.AddUserRule(ctx, desired.user.AccountingID, desired.resolvedOutbound)
+	// Правила маршрутизации уже установлены applyManagedConfig целой таблицей.
+	return nil
 }
 
 func reconcileRuntimeMatches(runtime reconcileRuntime, desired []reconcileDesiredUser) bool {

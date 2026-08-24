@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"slices"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -26,22 +27,26 @@ const (
 	usageFailureMessage      = "usage could not be finalized"
 )
 
-// XrayUserController управляет runtime-пользователями Xray и их правилами.
+// XrayUserController управляет runtime-пользователями Xray и таблицей маршрутизации.
+//
+// Точечных операций над правилами здесь нет намеренно: Xray заменяет routing
+// configuration только целиком, поэтому правила устанавливает ApplyRouting.
 type XrayUserController interface {
 	AddUser(context.Context, xray.User) error
 	RemoveUser(context.Context, string) error
 	User(context.Context, string) (xray.User, error)
 	Users(context.Context) ([]xray.User, error)
-	AddUserRule(context.Context, string, string) error
-	RemoveUserRule(context.Context, string) error
+	ApplyRouting(context.Context, xray.RoutingTable) error
 	UserRules(context.Context) ([]xray.UserRule, error)
 	TestUserRoute(context.Context, string) (string, error)
 }
 
 // XrayConfigWriter persists the complete agent-owned desired state in the
-// startup configuration consumed by Xray after a restart.
+// startup configuration consumed by Xray after a restart, and hands back the
+// routing table that has to be installed in the running process.
 type XrayConfigWriter interface {
 	Reconcile(context.Context, []xray.PersistentUser) error
+	DesiredRouting() (xray.RoutingTable, error)
 }
 
 // UsageFinalizer сохраняет и сбрасывает остаток трафика пользователей.
@@ -99,7 +104,7 @@ func (s *Service) EnsureUserPresent(
 	if err := s.storePresentIntent(ctx, desired, false); err != nil {
 		return retryableResult(operationID, stateFailureMessage), nil
 	}
-	if err := s.persistManagedConfig(ctx); err != nil {
+	if err := s.applyManagedConfig(ctx); err != nil {
 		return retryableResult(operationID, xrayFailureMessage), nil
 	}
 
@@ -126,7 +131,7 @@ func (s *Service) EnsureUserPresent(
 			return retryableResult(operationID, usageFailureMessage), nil
 		}
 	}
-	if err := s.applyPresent(ctx, observed, desired, resolvedOutbound); err != nil {
+	if err := s.applyPresent(ctx, observed, desired); err != nil {
 		return retryableResult(operationID, xrayFailureMessage), nil
 	}
 	verified, err := s.observeUser(ctx, desired.AccountingID)
@@ -204,7 +209,7 @@ func (s *Service) EnsureUserAbsent(
 		if err := s.storeAbsentIntent(ctx, tombstone, false); err != nil {
 			return retryableResult(operationID, stateFailureMessage), nil
 		}
-		if err := s.persistManagedConfig(ctx); err != nil {
+		if err := s.applyManagedConfig(ctx); err != nil {
 			return retryableResult(operationID, xrayFailureMessage), nil
 		}
 		return s.completeAbsent(
@@ -224,16 +229,12 @@ func (s *Service) EnsureUserAbsent(
 	if err := s.storeAbsentIntent(ctx, tombstone, false); err != nil {
 		return retryableResult(operationID, stateFailureMessage), nil
 	}
-	if err := s.persistManagedConfig(ctx); err != nil {
+	if err := s.applyManagedConfig(ctx); err != nil {
 		return retryableResult(operationID, xrayFailureMessage), nil
 	}
+	// Правило уже удалено applyManagedConfig вместе с перезаливкой таблицы.
 	if observed.user != nil {
 		if err := s.xray.RemoveUser(ctx, accountingID); err != nil {
-			return retryableResult(operationID, xrayFailureMessage), nil
-		}
-	}
-	if observed.rule != nil {
-		if err := s.xray.RemoveUserRule(ctx, accountingID); err != nil {
 			return retryableResult(operationID, xrayFailureMessage), nil
 		}
 	}
@@ -347,46 +348,32 @@ func (s *Service) presentMatches(
 	return outbound == resolvedOutbound, nil
 }
 
+// applyPresent приводит runtime-пользователя к желаемому состоянию.
+//
+// Правила маршрутизации здесь не трогаются: Xray умеет заменять только таблицу
+// целиком, поэтому её устанавливает applyManagedConfig — один раз за проход и
+// всегда до вызова applyPresent.
 func (s *Service) applyPresent(
 	ctx context.Context,
 	observed observedUser,
 	desired state.ManagedUser,
-	resolvedOutbound string,
 ) error {
-	if observed.user == nil ||
-		observed.user.CredentialUUID != desired.CredentialUUID ||
-		observed.user.Flow != desired.Flow {
-		if observed.user != nil {
-			if err := s.xray.RemoveUser(ctx, desired.AccountingID); err != nil {
-				return userRPCError(desired.AccountingID, "HandlerService.RemoveUser", err)
-			}
-		}
-		if err := s.xray.AddUser(ctx, xray.User{
-			AccountingID:   desired.AccountingID,
-			CredentialUUID: desired.CredentialUUID,
-			Flow:           desired.Flow,
-		}); err != nil {
-			return userRPCError(desired.AccountingID, "HandlerService.AddUser", err)
+	if observed.user != nil &&
+		observed.user.CredentialUUID == desired.CredentialUUID &&
+		observed.user.Flow == desired.Flow {
+		return nil
+	}
+	if observed.user != nil {
+		if err := s.xray.RemoveUser(ctx, desired.AccountingID); err != nil {
+			return userRPCError(desired.AccountingID, "HandlerService.RemoveUser", err)
 		}
 	}
-
-	ruleMatches := observed.rule != nil && observed.rule.OutboundTag == resolvedOutbound
-	if ruleMatches {
-		outbound, err := s.xray.TestUserRoute(ctx, desired.AccountingID)
-		ruleMatches = err == nil && outbound == resolvedOutbound
-		if err != nil && !errors.Is(err, xray.ErrRouteNotFound) {
-			return userRPCError(desired.AccountingID, "RoutingService.TestRoute", err)
-		}
-	}
-	if !ruleMatches {
-		if observed.rule != nil {
-			if err := s.xray.RemoveUserRule(ctx, desired.AccountingID); err != nil {
-				return userRPCError(desired.AccountingID, "RoutingService.RemoveRule", err)
-			}
-		}
-		if err := s.xray.AddUserRule(ctx, desired.AccountingID, resolvedOutbound); err != nil {
-			return userRPCError(desired.AccountingID, "RoutingService.AddRule", err)
-		}
+	if err := s.xray.AddUser(ctx, xray.User{
+		AccountingID:   desired.AccountingID,
+		CredentialUUID: desired.CredentialUUID,
+		Flow:           desired.Flow,
+	}); err != nil {
+		return userRPCError(desired.AccountingID, "HandlerService.AddUser", err)
 	}
 	return nil
 }
@@ -455,6 +442,56 @@ func (s *Service) persistManagedConfig(ctx context.Context) error {
 	return s.xrayConfig.Reconcile(ctx, desired)
 }
 
+// applyManagedConfig записывает желаемое состояние в конфигурацию Xray и сразу
+// устанавливает ту же таблицу маршрутизации в работающий процесс.
+//
+// Оба шага обязаны идти вместе: файл переживает рестарт, но не влияет на уже
+// запущенный Xray, а ApplyRouting меняет runtime, но не переживает рестарт.
+// Вызывать только под s.mutations, чтобы между записью и чтением файла не
+// вклинился другой проход.
+func (s *Service) applyManagedConfig(ctx context.Context) error {
+	if err := s.persistManagedConfig(ctx); err != nil {
+		return err
+	}
+	table, err := s.xrayConfig.DesiredRouting()
+	if err != nil {
+		return err
+	}
+	installed, err := s.xray.UserRules(ctx)
+	if err != nil {
+		return err
+	}
+	// Идемпотентный запрос не обязан трогать роутер: перезаливка одинаковой
+	// таблицы пересобирала бы условия всех правил на каждом вызове.
+	if routingConverged(installed, table.UserRules()) {
+		return nil
+	}
+	return s.xray.ApplyRouting(ctx, table)
+}
+
+// reinstallRouting переустанавливает таблицу безусловно.
+//
+// Её вызывают, когда ListRule согласуется с желаемым состоянием, а TestRoute
+// нет: сравнивать больше не с чем, а роутер всё равно маршрутизирует неверно.
+func (s *Service) reinstallRouting(ctx context.Context) error {
+	table, err := s.xrayConfig.DesiredRouting()
+	if err != nil {
+		return err
+	}
+	return s.xray.ApplyRouting(ctx, table)
+}
+
+// routingConverged сравнивает установленные и желаемые персональные правила.
+// Обе стороны уже отфильтрованы по префиксу агента и отсортированы, а rule_tag
+// однозначно выводится из accounting_id, поэтому сравнивать его незачем.
+func routingConverged(installed, desired []xray.UserRule) bool {
+	return slices.EqualFunc(installed, desired, func(left, right xray.UserRule) bool {
+		return left.AccountingID == right.AccountingID && left.OutboundTag == right.OutboundTag
+	})
+}
+
+// persistManagedConfigSafely сохраняет только файл: её вызывают, когда Xray
+// недоступен и устанавливать таблицу в runtime всё равно некуда.
 func (s *Service) persistManagedConfigSafely(ctx context.Context) error {
 	s.mutations.Lock()
 	defer s.mutations.Unlock()

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/xtls/xray-core/infra/conf"
 	jsonreader "github.com/xtls/xray-core/infra/conf/json"
 )
 
@@ -107,6 +108,45 @@ func (file *ConfigFile) Reconcile(ctx context.Context, users []PersistentUser) e
 		return err
 	}
 	return atomicWriteFile(file.path, payload, mode)
+}
+
+// DesiredRouting строит routing-секцию сохранённой конфигурации, чтобы работающий
+// Xray можно было перезагрузить ровно той таблицей, которая переживает рестарт.
+//
+// Файл — единственный источник истины: он содержит и правила инфраструктуры, и
+// персональные правила, и default-deny в нужном порядке. Реконструировать их из
+// RoutingService.ListRule нельзя, потому что тот отдаёт только tag и ruleTag без
+// условий сопоставления.
+//
+// Вызывающая сторона обязана сериализовать DesiredRouting с Reconcile, иначе
+// вернётся таблица промежуточного состояния.
+func (file *ConfigFile) DesiredRouting() (RoutingTable, error) {
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	configuration, _, err := file.read()
+	if err != nil {
+		return RoutingTable{}, err
+	}
+	routing, ok := configuration["routing"].(map[string]any)
+	if !ok {
+		return RoutingTable{}, errors.New("Xray config routing must be an object")
+	}
+	payload, err := json.Marshal(routing)
+	if err != nil {
+		return RoutingTable{}, fmt.Errorf("encode Xray routing config: %w", err)
+	}
+	var parsed conf.RouterConfig
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return RoutingTable{}, fmt.Errorf("decode Xray routing config: %w", err)
+	}
+	built, err := parsed.Build()
+	if err != nil {
+		return RoutingTable{}, fmt.Errorf("build Xray routing config: %w", err)
+	}
+	if len(built.Rule) == 0 {
+		return RoutingTable{}, errors.New("Xray routing config has no rules")
+	}
+	return RoutingTable{config: built}, nil
 }
 
 func (file *ConfigFile) read() (map[string]any, os.FileMode, error) {

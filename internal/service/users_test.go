@@ -105,7 +105,7 @@ func TestEnsureUserPresentContinuesAfterPartialRoutingFailure(t *testing.T) {
 		AccountingID: testAccountingID,
 		OutboundTag:  "old-egress",
 	}
-	runtime.failMethod = "AddUserRule"
+	runtime.failMethod = "ApplyRouting"
 	runtime.failErr = errors.New("Xray rejected secret 11111111-1111-4111-8111-111111111111")
 	request := presentRequest("operation-replace", testCredentialUUID, "bridge-test")
 
@@ -119,8 +119,10 @@ func TestEnsureUserPresentContinuesAfterPartialRoutingFailure(t *testing.T) {
 	}
 	assertManagedUser(t, store, true, false, testCredentialUUID, "bridge-test")
 	assertPendingOperation(t, store, request.GetOperationId())
-	if !slices.Equal(usage.calls, []string{testAccountingID}) {
-		t.Fatalf("финальные сборы = %v, ожидался один", usage.calls)
+	// Установка таблицы падает до правки пользователя, значит старый credential
+	// ещё жив и его трафик сбрасывать рано.
+	if len(usage.calls) != 0 {
+		t.Fatalf("трафик сброшен до фактической замены: %v", usage.calls)
 	}
 
 	second, err := service.EnsureUserPresent(context.Background(), request)
@@ -185,7 +187,7 @@ func TestEnsureUserAbsentFinalizesBeforeRemovalAndReplays(t *testing.T) {
 		t.Fatalf("EnsureUserAbsent() вернул gRPC-ошибку: %v", err)
 	}
 	assertApplyStatus(t, result, nodeagentv1.ApplyStatus_APPLY_STATUS_APPLIED)
-	wantEvents := []string{"FinalizeUser", "RemoveUser", "RemoveUserRule"}
+	wantEvents := []string{"FinalizeUser", "ApplyRouting", "RemoveUser"}
 	if !slices.Equal(events, wantEvents) {
 		t.Fatalf("порядок операций = %v, ожидался %v", events, wantEvents)
 	}
@@ -416,13 +418,21 @@ func newTestDependencies(t *testing.T, provider StatusProvider) Dependencies {
 }
 
 type fakeXrayConfigWriter struct {
-	users []xray.PersistentUser
-	err   error
+	users      []xray.PersistentUser
+	err        error
+	routingErr error
 }
 
 func (writer *fakeXrayConfigWriter) Reconcile(_ context.Context, users []xray.PersistentUser) error {
 	writer.users = slices.Clone(users)
 	return writer.err
+}
+
+func (writer *fakeXrayConfigWriter) DesiredRouting() (xray.RoutingTable, error) {
+	if writer.routingErr != nil {
+		return xray.RoutingTable{}, writer.routingErr
+	}
+	return xray.RoutingTableForUsers(writer.users)
 }
 
 func assertApplyStatus(t *testing.T, result *nodeagentv1.OperationResult, want nodeagentv1.ApplyStatus) {
@@ -540,30 +550,23 @@ func (controller *fakeXrayController) Users(context.Context) ([]xray.User, error
 	return users, nil
 }
 
-func (controller *fakeXrayController) AddUserRule(
+// ApplyRouting повторяет семантику Xray: таблица заменяется целиком, всё, чего
+// нет в запросе, исчезает из роутера.
+func (controller *fakeXrayController) ApplyRouting(
 	_ context.Context,
-	accountingID string,
-	outbound string,
+	table xray.RoutingTable,
 ) error {
-	controller.record("AddUserRule", true)
-	if err := controller.fail("AddUserRule"); err != nil {
+	controller.record("ApplyRouting", true)
+	if err := controller.fail("ApplyRouting"); err != nil {
 		return err
 	}
-	ruleTag, _ := xray.UserRuleTag(accountingID)
-	controller.rules[accountingID] = xray.UserRule{
-		AccountingID: accountingID,
-		OutboundTag:  outbound,
-		RuleTag:      ruleTag,
+	if table.Empty() {
+		return errors.New("routing table is required")
 	}
-	return nil
-}
-
-func (controller *fakeXrayController) RemoveUserRule(_ context.Context, accountingID string) error {
-	controller.record("RemoveUserRule", true)
-	if err := controller.fail("RemoveUserRule"); err != nil {
-		return err
+	controller.rules = make(map[string]xray.UserRule)
+	for _, rule := range table.UserRules() {
+		controller.rules[rule.AccountingID] = rule
 	}
-	delete(controller.rules, accountingID)
 	return nil
 }
 

@@ -3,10 +3,14 @@ package xray
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/xtls/xray-core/app/router"
 )
 
 func TestConfigFilePersistsUsersAndRulesBeforeLastDefaultDeny(t *testing.T) {
@@ -65,6 +69,68 @@ func TestConfigFilePersistsUsersAndRulesBeforeLastDefaultDeny(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o640 {
 		t.Fatalf("config mode = %v", info.Mode().Perm())
+	}
+}
+
+// Регрессия: таблица, уезжающая в работающий Xray, обязана содержать правила
+// всех пользователей сразу, правило инфраструктуры и default-deny в порядке
+// приоритета. Прежний код слал по одному правилу за раз с ShouldAppend=false,
+// поэтому в роутере выживало только последнее.
+func TestDesiredRoutingCarriesEveryRuleToRuntime(t *testing.T) {
+	path := copySmokeConfig(t)
+	file, err := NewConfigFile(path, "vless-in", "block")
+	if err != nil {
+		t.Fatalf("NewConfigFile() error = %v", err)
+	}
+	secondID := "u.bcdefghijklmnopqrstu"
+	if err := file.Reconcile(context.Background(), []PersistentUser{
+		{
+			User:        User{AccountingID: testAccountingID, CredentialUUID: testCredentialUUID, Flow: flowVision},
+			OutboundTag: "direct",
+		},
+		{
+			User:        User{AccountingID: secondID, CredentialUUID: "22222222-2222-4222-8222-222222222222"},
+			OutboundTag: "bridge-test",
+		},
+	}); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	table, err := file.DesiredRouting()
+	if err != nil {
+		t.Fatalf("DesiredRouting() error = %v", err)
+	}
+	if table.Empty() {
+		t.Fatal("DesiredRouting() вернула пустую таблицу")
+	}
+
+	routing := &fakeRoutingClient{}
+	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
+	if err := client.ApplyRouting(context.Background(), table); err != nil {
+		t.Fatalf("ApplyRouting() error = %v", err)
+	}
+	instance, err := routing.addRequest.GetConfig().GetInstance()
+	if err != nil {
+		t.Fatalf("декодировать routing config: %v", err)
+	}
+	rules := instance.(*router.Config).GetRule()
+	gotTags := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		gotTags = append(gotTags, rule.GetRuleTag())
+	}
+	// Первое правило — инфраструктурное (api) из fixture, у него нет ruleTag:
+	// оно обязано пережить установку таблицы. Пользователи идут отсортированно.
+	wantTags := []string{
+		"",
+		userRuleTagPrefix + testAccountingID,
+		userRuleTagPrefix + secondID,
+		defaultDenyRuleTagPrefix + "vless-in",
+	}
+	if !slices.Equal(gotTags, wantTags) {
+		t.Fatalf("rule_tag в runtime = %v, ожидались %v", gotTags, wantTags)
+	}
+	if got := rules[len(rules)-1].GetTag(); got != "block" {
+		t.Fatalf("последнее правило ведёт в %q, ожидался default-deny в block", got)
 	}
 }
 

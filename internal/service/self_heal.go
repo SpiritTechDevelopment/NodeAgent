@@ -137,6 +137,11 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 		return nil
 	}
 
+	// Таблица маршрутизации восстанавливается целиком и до правки пользователей,
+	// иначе восстановление одного намерения затирало бы правила всех остальных.
+	if err := s.applyManagedConfig(ctx); err != nil {
+		return err
+	}
 	runtime, err := s.observeReconcileRuntime(ctx)
 	if err != nil {
 		return err
@@ -153,31 +158,19 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 				continue
 			}
 			observed := runtimeUser(runtime, user.AccountingID)
-			if err := s.applyPresent(
-				ctx,
-				observed,
-				desired.user,
-				desired.resolvedOutbound,
-			); err != nil {
+			if err := s.applyPresent(ctx, observed, desired.user); err != nil {
 				operationErrors = append(operationErrors, err)
 				continue
 			}
 			eligible[user.AccountingID] = user
 			continue
 		}
+		// Правило снятого пользователя уже убрано applyManagedConfig.
 		observed := runtimeUser(runtime, user.AccountingID)
 		if observed.user != nil {
 			if err := s.xray.RemoveUser(ctx, user.AccountingID); err != nil {
 				operationErrors = append(operationErrors, userRPCError(
 					user.AccountingID, "HandlerService.RemoveUser", err,
-				))
-				continue
-			}
-		}
-		if observed.rule != nil {
-			if err := s.xray.RemoveUserRule(ctx, user.AccountingID); err != nil {
-				operationErrors = append(operationErrors, userRPCError(
-					user.AccountingID, "RoutingService.RemoveRule", err,
 				))
 				continue
 			}
@@ -243,7 +236,7 @@ func (s *Service) recoverIntents(ctx context.Context) error {
 func (s *Service) auditManagedUsers(ctx context.Context) error {
 	s.mutations.Lock()
 	defer s.mutations.Unlock()
-	if err := s.persistManagedConfig(ctx); err != nil {
+	if err := s.applyManagedConfig(ctx); err != nil {
 		return err
 	}
 
@@ -276,7 +269,7 @@ func (s *Service) auditManagedUsers(ctx context.Context) error {
 			continue
 		}
 		if !matches {
-			if err := s.applyPresent(ctx, observed, user, desired.resolvedOutbound); err != nil {
+			if err := s.applyPresent(ctx, observed, user); err != nil {
 				operationErrors = append(operationErrors, err)
 				continue
 			}

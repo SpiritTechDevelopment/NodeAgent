@@ -344,7 +344,7 @@ func TestReconcileUsersRejectsSetAboveConfiguredLimit(t *testing.T) {
 
 func TestReconcileUsersContinuesPendingPartialApplication(t *testing.T) {
 	service, store, runtime, _ := newUserTestService(t)
-	runtime.failMethod = "AddUserRule"
+	runtime.failMethod = "ApplyRouting"
 	runtime.failErr = errors.New("routing unavailable")
 	request := &nodeagentv1.ReconcileUsersRequest{
 		OperationId: "reconcile-retry",
@@ -370,7 +370,9 @@ func TestReconcileUsersContinuesPendingPartialApplication(t *testing.T) {
 		t.Fatalf("повторный ReconcileUsers() вернул gRPC-ошибку: %v", err)
 	}
 	assertApplyStatus(t, second.GetOperation(), nodeagentv1.ApplyStatus_APPLY_STATUS_APPLIED)
-	if second.GetReplaced() != 1 {
+	// Таблица устанавливается до правки пользователей, поэтому сбой не оставляет
+	// полупринятого пользователя: повтор видит чистый runtime и считает его added.
+	if second.GetAdded() != 1 {
 		t.Fatalf("счётчики продолженной попытки = %+v", second)
 	}
 	assertRuntimeUser(t, runtime, testCredentialUUID, "direct")
@@ -404,9 +406,9 @@ func TestReconcileUsersRepairsEffectiveRouteDrift(t *testing.T) {
 	if response.GetReplaced() != 1 || response.GetUnchanged() != 0 {
 		t.Fatalf("route drift counters = %+v", response)
 	}
-	if !slices.Contains(runtime.calls, "mutation:RemoveUserRule") ||
-		!slices.Contains(runtime.calls, "mutation:AddUserRule") {
-		t.Fatalf("route drift не переустановил правило: %v", runtime.calls)
+	// Точечной правки правила больше нет: дрейф чинится переустановкой таблицы.
+	if !slices.Contains(runtime.calls, "mutation:ApplyRouting") {
+		t.Fatalf("route drift не переустановил таблицу: %v", runtime.calls)
 	}
 }
 

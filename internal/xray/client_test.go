@@ -104,48 +104,83 @@ func TestHealthWrapsServiceFailures(t *testing.T) {
 	}
 }
 
-func TestAddUserRulePrependsRuleBeforeDefaultDeny(t *testing.T) {
+// ApplyRouting обязана присылать таблицу целиком: ShouldAppend=false очищает и
+// правила, и балансировщики Xray, поэтому всё, чего нет в запросе, будет
+// уничтожено — правила остальных пользователей, правила инфраструктуры и
+// завершающий default-deny.
+func TestApplyRoutingSendsCompleteTable(t *testing.T) {
 	routing := &fakeRoutingClient{}
 	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
 
-	if err := client.AddUserRule(context.Background(), testAccountingID, "direct"); err != nil {
-		t.Fatalf("AddUserRule() вернул ошибку: %v", err)
+	secondID := "u.bcdefghijklmnopqrstu"
+	table := RoutingTable{config: &router.Config{Rule: []*router.RoutingRule{
+		{
+			TargetTag:  &router.RoutingRule_Tag{Tag: "api"},
+			RuleTag:    "infra:api",
+			InboundTag: []string{"api"},
+		},
+		{
+			TargetTag: &router.RoutingRule_Tag{Tag: "direct"},
+			RuleTag:   userRuleTagPrefix + testAccountingID,
+			UserEmail: []string{testAccountingID},
+		},
+		{
+			TargetTag: &router.RoutingRule_Tag{Tag: "bridge-test"},
+			RuleTag:   userRuleTagPrefix + secondID,
+			UserEmail: []string{secondID},
+		},
+		{
+			TargetTag:  &router.RoutingRule_Tag{Tag: "block"},
+			RuleTag:    defaultDenyRuleTagPrefix + "vless-in",
+			InboundTag: []string{"vless-in"},
+		},
+	}}}
+	if err := client.ApplyRouting(context.Background(), table); err != nil {
+		t.Fatalf("ApplyRouting() вернул ошибку: %v", err)
 	}
+
 	request := routing.addRequest
 	if request == nil {
 		t.Fatal("AddRule не был вызван")
 	}
 	if request.GetShouldAppend() {
-		t.Error("should_append=true: персональное правило оказалось бы после default-deny")
+		t.Error("should_append=true: правила легли бы после default-deny")
 	}
 	if got := request.GetConfig().GetType(); got != "xray.app.router.Config" {
 		t.Fatalf("тип config = %q, ожидался xray.app.router.Config", got)
 	}
-
 	instance, err := request.GetConfig().GetInstance()
 	if err != nil {
-		t.Fatalf("декодировать routing rule: %v", err)
+		t.Fatalf("декодировать routing config: %v", err)
 	}
 	configuration, ok := instance.(*router.Config)
 	if !ok {
 		t.Fatalf("тип routing config = %T", instance)
 	}
-	if len(configuration.GetRule()) != 1 {
-		t.Fatalf("число routing rules = %d, ожидалось 1", len(configuration.GetRule()))
+	gotTags := make([]string, 0, len(configuration.GetRule()))
+	for _, rule := range configuration.GetRule() {
+		gotTags = append(gotTags, rule.GetRuleTag())
 	}
-	rule := configuration.GetRule()[0]
-	wantRuleTag := "spirit-agent:user:" + testAccountingID
-	if rule.GetRuleTag() != wantRuleTag {
-		t.Errorf("rule_tag = %q, ожидался %q", rule.GetRuleTag(), wantRuleTag)
+	wantTags := []string{
+		"infra:api",
+		userRuleTagPrefix + testAccountingID,
+		userRuleTagPrefix + secondID,
+		defaultDenyRuleTagPrefix + "vless-in",
 	}
-	if rule.GetTag() != "direct" {
-		t.Errorf("outbound tag = %q, ожидался direct", rule.GetTag())
+	if !slices.Equal(gotTags, wantTags) {
+		t.Fatalf("отправленные rule_tag = %v, ожидались %v", gotTags, wantTags)
 	}
-	if !slices.Equal(rule.GetUserEmail(), []string{testAccountingID}) {
-		t.Errorf("user_email = %v, ожидался %q", rule.GetUserEmail(), testAccountingID)
+}
+
+func TestApplyRoutingRejectsEmptyTable(t *testing.T) {
+	routing := &fakeRoutingClient{}
+	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
+
+	if err := client.ApplyRouting(context.Background(), RoutingTable{}); err == nil {
+		t.Fatal("ApplyRouting() приняла пустую таблицу")
 	}
-	if len(rule.GetInboundTag()) != 0 {
-		t.Errorf("inbound_tag = %v, ожидался пустой фильтр", rule.GetInboundTag())
+	if routing.addRequest != nil {
+		t.Error("пустая таблица дошла до Xray и стёрла бы всю маршрутизацию")
 	}
 }
 
@@ -155,8 +190,13 @@ func TestRoutingMethodsWrapFailures(t *testing.T) {
 	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
 	ctx := context.Background()
 
-	if err := client.AddUserRule(ctx, testAccountingID, "direct"); !errors.Is(err, wantErr) {
-		t.Errorf("AddUserRule() error = %v, ожидалась исходная ошибка", err)
+	table := RoutingTable{config: &router.Config{Rule: []*router.RoutingRule{{
+		TargetTag: &router.RoutingRule_Tag{Tag: "direct"},
+		RuleTag:   userRuleTagPrefix + testAccountingID,
+		UserEmail: []string{testAccountingID},
+	}}}}
+	if err := client.ApplyRouting(ctx, table); !errors.Is(err, wantErr) {
+		t.Errorf("ApplyRouting() error = %v, ожидалась исходная ошибка", err)
 	}
 	if err := client.RemoveUserRule(ctx, testAccountingID); !errors.Is(err, wantErr) {
 		t.Errorf("RemoveUserRule() error = %v, ожидалась исходная ошибка", err)
@@ -254,15 +294,8 @@ func TestUserRuleValidationStopsBeforeRPC(t *testing.T) {
 	client := newClient(io.NopCloser(nilReader{}), &fakeStatsClient{}, routing)
 	ctx := context.Background()
 
-	if err := client.AddUserRule(ctx, "invalid", "direct"); err == nil {
-		t.Error("AddUserRule() не отклонил accounting_id")
-	}
-	if err := client.AddUserRule(ctx, testAccountingID, " "); err == nil {
-		t.Error("AddUserRule() не отклонил пустой outbound tag")
-	}
-	if err := client.AddUserRule(ctx, testAccountingID, " direct"); err == nil {
-		t.Error("AddUserRule() не отклонил пробел в outbound tag")
-	}
+	// accounting_id и outbound tag проверяет ConfigFile.Reconcile: таблицу теперь
+	// собирает конфигурация, а не отдельный вызов клиента.
 	if err := client.RemoveUserRule(ctx, "invalid"); err == nil {
 		t.Error("RemoveUserRule() не отклонил accounting_id")
 	}
